@@ -45,16 +45,117 @@ function App() {
                 weightConfig: weightConfig
             };
 
-            const response = await combineTrucks(uploadedFile, request);
+            // Keep planningWhse consistent with Dashboard (persisted in localStorage)
+            const planningWhse = (typeof window !== 'undefined' && localStorage.getItem('planningWhse')) || undefined;
+            const response = await combineTrucks(uploadedFile, request, { planningWhse: planningWhse || undefined });
 
-            if (response.success) {
-                // Update the optimization results with the new truck combination
-                // This is a simplified update - in a real app you'd want more sophisticated state management
+            if (response.success && optimizeResults) {
+                // Merge updated assignments for changed trucks
+                const changedTruckIds = new Set<number>([
+                    ...combinedTruckIds,
+                    ...(response.removedTruckIds || []),
+                    response.newTruck ? response.newTruck.truckNumber : undefined,
+                ].filter((x): x is number => typeof x === 'number'));
+
+                const updatedAssignmentsMap = new Map<string, typeof optimizeResults.assignments[number]>();
+                for (const a of response.updatedAssignments) {
+                    const key = `${a.truckNumber}-${a.so}-${a.line}`;
+                    updatedAssignmentsMap.set(key, a);
+                }
+
+                // Replace assignments for changed trucks
+                const newAssignments = optimizeResults.assignments.map(a => {
+                    if (changedTruckIds.has(a.truckNumber)) {
+                        const key = `${a.truckNumber}-${a.so}-${a.line}`;
+                        return updatedAssignmentsMap.get(key) || a;
+                    }
+                    return a;
+                });
+
+                // Filter out assignments that moved off removed trucks
+                const existingKeys = new Set(Array.from(updatedAssignmentsMap.keys()));
+                const assignmentsFinal = newAssignments.filter(a => {
+                    if (changedTruckIds.has(a.truckNumber)) {
+                        const key = `${a.truckNumber}-${a.so}-${a.line}`;
+                        return existingKeys.has(key);
+                    }
+                    return true;
+                });
+
+                // Rebuild trucks list: remove removed trucks, update/insert target truck and recompute summaries
+                const trucksById = new Map(optimizeResults.trucks.map(t => [t.truckNumber, { ...t }]));
+                for (const rid of response.removedTruckIds || []) {
+                    trucksById.delete(rid);
+                }
+                // Helper to recompute summary for a truck from assignments
+                const recomputeSummary = (truckId: number) => {
+                    const tAssigns = assignmentsFinal.filter(a => a.truckNumber === truckId);
+                    if (tAssigns.length === 0) {
+                        trucksById.delete(truckId);
+                        return;
+                    }
+                    const any = tAssigns[0];
+                    const isTexas = (any.customerState || '').toUpperCase() === 'TX' || (any.customerState || '').toUpperCase() === 'TEXAS';
+                    const max = isTexas ? weightConfig.texas_max_lbs : weightConfig.other_max_lbs;
+                    const min = isTexas ? weightConfig.texas_min_lbs : weightConfig.other_min_lbs;
+                    const totalWeight = tAssigns.reduce((s, a) => s + a.totalWeight, 0);
+                    const totalPieces = tAssigns.reduce((s, a) => s + a.piecesOnTransport, 0);
+                    const totalLines = tAssigns.length;
+                    const totalOrders = new Set(tAssigns.map(a => a.so)).size;
+                    const maxWidth = Math.max(...tAssigns.map(a => a.width || 0));
+                    const containsLate = tAssigns.some(a => a.isLate);
+                    const bucket = containsLate ? 'Late' : 'WithinWindow';
+                    const prev = trucksById.get(truckId);
+            const updated = {
+                        ...(prev || {
+                            truckNumber: truckId,
+                            customerName: any.customerName,
+                            customerAddress: undefined,
+                            customerCity: any.customerCity,
+                            customerState: any.customerState,
+                zone: (prev as any)?.zone ?? null,
+                route: (prev as any)?.route ?? null,
+                        }),
+                        totalWeight,
+                        minWeight: min,
+                        maxWeight: max,
+                        totalOrders,
+                        totalLines,
+                        totalPieces,
+                        maxWidth,
+                        percentOverwidth: 0,
+                        containsLate,
+                        priorityBucket: bucket,
+                    } as typeof optimizeResults.trucks[number];
+                    trucksById.set(truckId, updated);
+                };
+
+                // Apply recomputations for all changed trucks
+                changedTruckIds.forEach(id => {
+                    if (response.newTruck && id === response.newTruck.truckNumber) {
+                        trucksById.set(id, response.newTruck);
+                    } else {
+                        recomputeSummary(id);
+                    }
+                });
+
+                // Recompute sections by priority from the modified trucks
+                const newTrucks = Array.from(trucksById.values());
+                const sections: OptimizeResponse['sections'] = {};
+                for (const t of newTrucks) {
+                    const bucket = t.priorityBucket || 'WithinWindow';
+                    if (!sections[bucket]) sections[bucket] = [];
+                    sections[bucket].push(t.truckNumber);
+                }
+
+                setOptimizeResults({
+                    ...optimizeResults,
+                    trucks: newTrucks,
+                    assignments: assignmentsFinal,
+                    sections,
+                });
+
                 alert(`✅ ${response.message}`);
-
-                // Optionally refresh the data or update the state
-                // For now, just show success message
-                console.log('Combination successful:', response);
             } else {
                 alert(`❌ Failed to combine trucks: ${response.message}`);
             }

@@ -9,7 +9,15 @@ from io import BytesIO
 import re
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
-from .schemas import UploadPreviewResponse, OptimizeRequest, OptimizeResponse, TruckSummary, LineAssignment
+from .schemas import (
+    UploadPreviewResponse,
+    OptimizeRequest,
+    OptimizeResponse,
+    TruckSummary,
+    LineAssignment,
+    CombineTrucksRequest,
+    CombineTrucksResponse,
+)
 from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
 
@@ -224,6 +232,179 @@ def update_no_multi_stop_customers(customers: List[str]) -> Dict[str, str]:
     NO_MULTI_STOP_CUSTOMERS.clear()
     NO_MULTI_STOP_CUSTOMERS.extend(customers)
     return {"message": f"Updated no-multi-stop list with {len(customers)} customers"}
+
+
+@app.post("/combine-trucks", response_model=CombineTrucksResponse)
+async def combine_trucks(
+    file: UploadFile = File(...),
+    request: str = Form(...),
+    planningWhse: Optional[str] = Form(None),
+) -> CombineTrucksResponse:
+    """Combine selected lines into a single truck.
+
+    Notes:
+    - Stateless: recomputes trucks/assignments from the uploaded file.
+    - Matches selected lines by (SO, Line) ignoring the client-side truck numbers to avoid numbering drift.
+    - Chooses the lightest truck among those containing the selected lines as the target truck.
+    """
+    # Parse request payload
+    try:
+        req = CombineTrucksRequest.model_validate_json(request)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}") from exc
+
+    # Load Excel
+    try:
+        content: bytes = await file.read()
+        buffer = BytesIO(content)
+        df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+
+    # Compute fields and optimize (deterministic grouping)
+    # Optional: filter to Planning Whse to align with UI selection
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
+    df = compute_calculated_fields(df)
+    cfg = {
+        "texas_max_lbs": req.weightConfig.texas_max_lbs,
+        "texas_min_lbs": req.weightConfig.texas_min_lbs,
+        "other_max_lbs": req.weightConfig.other_max_lbs,
+        "other_min_lbs": req.weightConfig.other_min_lbs,
+    }
+    try:
+        trucks_df, assigns_df = naive_grouping(df.copy(), cfg)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Optimization failed: {exc}") from exc
+
+    if trucks_df.empty or assigns_df.empty:
+        return CombineTrucksResponse(success=False, message="No trucks or assignments to combine", updatedAssignments=[], removedTruckIds=[])
+
+    # Parse selected lines: id format "truckNumber-SO-Line"
+    sel_pairs: List[tuple[str, str]] = []
+    for lid in req.lineIds:
+        parts = str(lid).split("-")
+        if len(parts) < 3:
+            continue
+        _, so, line = parts[-3], parts[-2], parts[-1]
+        sel_pairs.append((str(so), str(line)))
+    if not sel_pairs:
+        return CombineTrucksResponse(success=False, message="No valid line IDs provided", updatedAssignments=[], removedTruckIds=[])
+
+    # Find matching assignment rows
+    def as_str(s: Any) -> str:
+        return str(s)
+
+    assigns_df = assigns_df.copy()
+    assigns_df["__so_key__"] = assigns_df["so"].map(as_str)
+    assigns_df["__line_key__"] = assigns_df["line"].map(as_str)
+    mask_selected = assigns_df.apply(lambda r: (r["__so_key__"], r["__line_key__"]) in sel_pairs, axis=1)
+    selected_rows = assigns_df[mask_selected]
+    if selected_rows.empty:
+        return CombineTrucksResponse(success=False, message="Selected lines not found in current optimization", updatedAssignments=[], removedTruckIds=[])
+
+    # Determine candidate trucks and target (lightest among involved)
+    involved_trucks = sorted(set(int(t) for t in selected_rows["truckNumber"].tolist()))
+    trucks_sub = trucks_df[trucks_df["truckNumber"].isin(involved_trucks)]
+    if trucks_sub.empty:
+        return CombineTrucksResponse(success=False, message="Candidate trucks not found", updatedAssignments=[], removedTruckIds=[])
+    target_row = trucks_sub.sort_values("totalWeight").iloc[0]
+    target_truck = int(target_row["truckNumber"])  # lightest
+
+    # Compute total selected weight and validate against target's max
+    total_selected_weight = float(selected_rows["totalWeight"].sum())
+    target_max = float(target_row.get("maxWeight") or 0.0)
+    if target_max > 0 and (float(target_row.get("totalWeight") or 0.0) + total_selected_weight) > target_max * 1.0001:
+        return CombineTrucksResponse(success=False, message="Combination exceeds target truck max weight", updatedAssignments=[], removedTruckIds=[])
+
+    # Reassign selected lines to target
+    source_trucks_before = set(involved_trucks)
+    assigns_df.loc[mask_selected, "truckNumber"] = target_truck
+
+    # Determine removed trucks (those that had only selected lines)
+    remaining_by_truck = assigns_df.groupby("truckNumber").size()
+    removed = [t for t in source_trucks_before if t != target_truck and t not in remaining_by_truck.index.tolist()]
+
+    # Recompute target truck summary from its assignments
+    t_assigns = assigns_df[assigns_df["truckNumber"] == target_truck].copy()
+    # Determine state and limits from any row
+    any_state = str(t_assigns["customerState"].iloc[0]) if not t_assigns.empty else ""
+    is_texas = str(any_state).strip().upper() in {"TX", "TEXAS"}
+    max_weight = cfg["texas_max_lbs"] if is_texas else cfg["other_max_lbs"]
+    min_weight = cfg["texas_min_lbs"] if is_texas else cfg["other_min_lbs"]
+    total_weight = float(t_assigns["totalWeight"].sum())
+    total_pieces = int(t_assigns["piecesOnTransport"].sum())
+    total_lines = int(t_assigns.shape[0])
+    total_orders = int(t_assigns["so"].nunique())
+    max_width = float(t_assigns["width"].max()) if not t_assigns.empty else 0.0
+    contains_late = bool(t_assigns["isLate"].any()) if "isLate" in t_assigns.columns else False
+    priority_bucket = "Late" if contains_late else "WithinWindow"
+    # Use first destination/customer for summary context
+    customer_name = str(t_assigns["customerName"].iloc[0]) if not t_assigns.empty else ""
+    customer_city = str(t_assigns["customerCity"].iloc[0]) if not t_assigns.empty else ""
+    customer_state = any_state
+    zone_val = None
+    route_val = None
+
+    new_truck_summary = TruckSummary(
+        truckNumber=target_truck,
+        customerName=customer_name,
+        customerAddress=None,
+        customerCity=customer_city,
+        customerState=customer_state,
+        zone=zone_val,
+        route=route_val,
+        totalWeight=float(total_weight),
+        minWeight=int(min_weight),
+        maxWeight=int(max_weight),
+        totalOrders=int(total_orders),
+        totalLines=int(total_lines),
+        totalPieces=int(total_pieces),
+        maxWidth=float(max_width),
+        percentOverwidth=float(0.0),
+        containsLate=bool(contains_late),
+        priorityBucket=str(priority_bucket),
+    )
+
+    # Build updated assignments for changed trucks only
+    changed_trucks = set(source_trucks_before) | {target_truck}
+    updated_assignments_rows = assigns_df[assigns_df["truckNumber"].isin(list(changed_trucks))]
+    updated_assignments: List[LineAssignment] = []
+    for _, a in updated_assignments_rows.iterrows():
+        tnum_val = a.get("truckNumber")
+        try:
+            tnum_int = int(tnum_val) if pd.notna(tnum_val) else target_truck
+        except Exception:
+            tnum_int = target_truck
+        updated_assignments.append(LineAssignment(
+            truckNumber=tnum_int,
+            so=str(a.get("so")),
+            line=str(a.get("line")),
+            customerName=str(a.get("customerName")),
+            customerAddress=a.get("customerAddress"),
+            customerCity=str(a.get("customerCity")),
+            customerState=str(a.get("customerState")),
+            piecesOnTransport=int(a.get("piecesOnTransport") or 0),
+            totalReadyPieces=int(a.get("totalReadyPieces") or 0),
+            weightPerPiece=float(a.get("weightPerPiece") or 0.0),
+            totalWeight=float(a.get("totalWeight") or 0.0),
+            width=float(a.get("width") or 0.0),
+            isOverwidth=bool(a.get("isOverwidth", False)),
+            isLate=bool(a.get("isLate", False)),
+            earliestDue=str(a.get("earliestDue")) if pd.notna(a.get("earliestDue")) else None,
+            latestDue=str(a.get("latestDue")) if pd.notna(a.get("latestDue")) else None,
+        ))
+
+    return CombineTrucksResponse(
+        success=True,
+        message=f"Combined {len(selected_rows)} lines into truck {target_truck}",
+        newTruck=new_truck_summary,
+        updatedAssignments=updated_assignments,
+        removedTruckIds=[int(i) for i in removed],
+    )
 
 
 @app.post("/export/dh-load-list")

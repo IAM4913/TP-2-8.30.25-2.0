@@ -71,11 +71,15 @@ export const exportDhLoadList = async (file: File, plannedDeliveryCol?: string, 
 
 export const combineTrucks = async (
     file: File,
-    request: CombineTrucksRequest
+    request: CombineTrucksRequest,
+    opts?: { planningWhse?: string }
 ): Promise<CombineTrucksResponse> => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('request', JSON.stringify(request));
+    if (opts?.planningWhse) {
+        formData.append('planningWhse', opts.planningWhse);
+    }
 
     const response = await api.post('/combine-trucks', formData, {
         headers: {
