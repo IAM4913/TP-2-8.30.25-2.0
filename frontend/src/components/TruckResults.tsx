@@ -54,11 +54,10 @@ const TruckResults: React.FC<TruckResultsProps> = ({
     };
 
     const handleExportDhLoadList = async () => {
-        const input = window.prompt('Enter the exact column name for "Planned delivery date" (optional). Leave blank to default to next business day:');
-        const col = input && input.trim().length > 0 ? input.trim() : undefined;
+        // Default to next business day (do not prompt for planned delivery column)
         setExportingDh(true);
         try {
-            const blob = await exportDhLoadList(file, col, { planningWhse });
+            const blob = await exportDhLoadList(file, undefined, { planningWhse });
             if (!blob || !(blob instanceof Blob) || blob.size === 0) {
                 throw new Error('Empty response');
             }
