@@ -18,11 +18,14 @@ export const uploadPreview = async (file: File): Promise<UploadPreviewResponse> 
     return response.data;
 };
 
-export const optimizeRoutes = async (file: File): Promise<OptimizeResponse> => {
+export const optimizeRoutes = async (file: File, opts?: { planningWhse?: string }): Promise<OptimizeResponse> => {
     const formData = new FormData();
     formData.append('file', file);
-
-    // TODO: Add weight config support via form parameters
+    if (opts?.planningWhse) {
+        formData.append('planningWhse', opts.planningWhse);
+    } else {
+        formData.append('planningWhse', 'ZAC');
+    }
 
     const response = await api.post('/optimize', formData, {
         headers: {
@@ -33,13 +36,30 @@ export const optimizeRoutes = async (file: File): Promise<OptimizeResponse> => {
     return response.data;
 };
 
-export const exportTrucks = async (file: File): Promise<Blob> => {
+export const exportTrucks = async (file: File, opts?: { planningWhse?: string }): Promise<Blob> => {
     const formData = new FormData();
     formData.append('file', file);
-
-    // TODO: Add weight config support via form parameters
+    formData.append('planningWhse', opts?.planningWhse || 'ZAC');
 
     const response = await api.post('/export/trucks', formData, {
+        headers: {
+            'Content-Type': 'multipart/form-data',
+        },
+        responseType: 'blob',
+    });
+
+    return response.data;
+};
+
+export const exportDhLoadList = async (file: File, plannedDeliveryCol?: string, opts?: { planningWhse?: string }): Promise<Blob> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('planningWhse', opts?.planningWhse || 'ZAC');
+    if (plannedDeliveryCol) {
+        formData.append('plannedDeliveryCol', plannedDeliveryCol);
+    }
+
+    const response = await api.post('/export/dh-load-list', formData, {
         headers: {
             'Content-Type': 'multipart/form-data',
         },
@@ -53,12 +73,8 @@ export const combineTrucks = async (
     file: File,
     request: CombineTrucksRequest
 ): Promise<CombineTrucksResponse> => {
-    // Create FormData for the file and add JSON data as form fields
     const formData = new FormData();
     formData.append('file', file);
-
-    // Add the request data as a JSON string in the form
-    // The FastAPI endpoint will need to be modified to handle this
     formData.append('request', JSON.stringify(request));
 
     const response = await api.post('/combine-trucks', formData, {

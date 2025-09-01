@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Download, Upload, Eye, Truck, AlertTriangle, Clock, CheckCircle } from 'lucide-react';
-import { exportTrucks } from '../api';
+import { exportTrucks, exportDhLoadList } from '../api';
 import { OptimizeResponse, TruckSummary } from '../types';
 
 interface TruckResultsProps {
@@ -16,6 +16,10 @@ const TruckResults: React.FC<TruckResultsProps> = ({
 }) => {
     const [selectedTruck, setSelectedTruck] = useState<number | null>(null);
     const [exporting, setExporting] = useState(false);
+    const [exportingDh, setExportingDh] = useState(false);
+
+    // Attempt to infer planningWhse used from localStorage (set by Dashboard), else default ZAC
+    const planningWhse = (typeof window !== 'undefined' && localStorage.getItem('planningWhse')) || 'ZAC';
 
     // Helper to calculate utilization safely
     const calcUtilization = (truck: TruckSummary) => {
@@ -33,7 +37,7 @@ const TruckResults: React.FC<TruckResultsProps> = ({
     const handleExport = async () => {
         setExporting(true);
         try {
-            const blob = await exportTrucks(file);
+            const blob = await exportTrucks(file, { planningWhse });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -46,6 +50,31 @@ const TruckResults: React.FC<TruckResultsProps> = ({
             console.error('Export failed:', error);
         } finally {
             setExporting(false);
+        }
+    };
+
+    const handleExportDhLoadList = async () => {
+        const input = window.prompt('Enter the exact column name for "Planned delivery date" (optional). Leave blank to default to next business day:');
+        const col = input && input.trim().length > 0 ? input.trim() : undefined;
+        setExportingDh(true);
+        try {
+            const blob = await exportDhLoadList(file, col, { planningWhse });
+            if (!blob || !(blob instanceof Blob) || blob.size === 0) {
+                throw new Error('Empty response');
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'dh_load_list.xlsx';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error('Export DH Load List failed:', error);
+            window.alert('Failed to create DH Load List. Please check DevTools > Network for /api/export/dh-load-list.');
+        } finally {
+            setExportingDh(false);
         }
     };
 
@@ -108,6 +137,14 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                     >
                         <Download className="h-4 w-4 mr-2" />
                         {exporting ? 'Exporting...' : 'Export Excel'}
+                    </button>
+                    <button
+                        onClick={handleExportDhLoadList}
+                        disabled={exportingDh}
+                        className="inline-flex items-center px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                        <Download className="h-4 w-4 mr-2" />
+                        {exportingDh ? 'Creating…' : 'DH Load List'}
                     </button>
                 </div>
             </div>

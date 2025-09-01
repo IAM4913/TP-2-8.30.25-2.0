@@ -2,20 +2,15 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, cast
+from typing import List, Optional, Dict, Any
+import datetime as _dt
 import pandas as pd
-import json
 from io import BytesIO
-from .schemas import (
-    UploadPreviewResponse,
-    OptimizeRequest,
-    OptimizeResponse,
-    CombineTrucksRequest,
-    CombineTrucksResponse,
-    TruckSummary,
-    LineAssignment,
-)
-from .excel_utils import compute_calculated_fields, filter_by_planning_whse
+import re
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+from .schemas import UploadPreviewResponse, OptimizeRequest, OptimizeResponse, TruckSummary, LineAssignment
+from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
 
 
@@ -64,7 +59,6 @@ async def upload_preview(file: UploadFile = File(...)) -> UploadPreviewResponse:
         buffer = BytesIO(content)
         # Read with openpyxl engine for .xlsx
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
-        df = filter_by_planning_whse(df, ("ZAC",))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=400, detail=f"Failed to read Excel: {exc}") from exc
@@ -75,19 +69,26 @@ async def upload_preview(file: UploadFile = File(...)) -> UploadPreviewResponse:
     missing = [col for col in REQUIRED_COLUMNS_MAPPED if col not in headers]
 
     # Provide a small sample for UI validation
-    raw_sample = df.head(5).to_dict(orient="records") if not df.empty else []
-    sample_records: List[Dict[str, Any]] = cast(List[Dict[str, Any]], raw_sample)
+    sample_records = df.head(5).to_dict(orient="records") if not df.empty else []
+
+    # Normalize sample keys to strings
+    norm_sample: List[Dict[str, Any]] = []
+    for rec in sample_records:
+        norm_sample.append({str(k): v for k, v in rec.items()})
 
     return UploadPreviewResponse(
         headers=headers,
         rowCount=int(df.shape[0]),
         missingRequiredColumns=missing,
-        sample=sample_records,
+        sample=norm_sample,
     )
 
 
 @app.post("/optimize", response_model=OptimizeResponse)
-async def optimize(file: UploadFile = File(...)) -> OptimizeResponse:
+async def optimize(
+    file: UploadFile = File(...),
+    planningWhse: Optional[str] = Form("ZAC"),
+) -> OptimizeResponse:
     filename = file.filename or ""
     if not filename.lower().endswith(".xlsx"):
         raise HTTPException(
@@ -96,10 +97,17 @@ async def optimize(file: UploadFile = File(...)) -> OptimizeResponse:
         content: bytes = await file.read()
         buffer = BytesIO(content)
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
-        df = filter_by_planning_whse(df, ("ZAC",))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+
+    # Filter to Planning Whse first (defaults to ZAC); if column not present, no-op
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            # If anything goes wrong, fall back to unfiltered to avoid blocking
+            pass
 
     df = compute_calculated_fields(df)
 
@@ -131,25 +139,24 @@ async def optimize(file: UploadFile = File(...)) -> OptimizeResponse:
         for bucket, g in trucks_df.groupby("priorityBucket"):
             sections[str(bucket)] = list(map(int, g["truckNumber"].tolist()))
 
-    trucks_list_raw = trucks_df.to_dict(orient="records") if not trucks_df.empty else []
-    assigns_list_raw = assigns_df.to_dict(orient="records") if not assigns_df.empty else []
-    # Ensure keys are strings for Pydantic unpacking
-    trucks_list: List[Dict[str, Any]] = [
-        {str(k): v for k, v in t.items()} for t in trucks_list_raw
-    ]
-    assigns_list: List[Dict[str, Any]] = [
-        {str(k): v for k, v in a.items()} for a in assigns_list_raw
-    ]
+    trucks_list = trucks_df.to_dict(orient="records") if not trucks_df.empty else []
+    assigns_list = assigns_df.to_dict(orient="records") if not assigns_df.empty else []
+    # Ensure JSON-serializable keys and create typed models
+    trucks_models: List[TruckSummary] = [TruckSummary(**{str(k): v for k, v in t.items()}) for t in trucks_list]
+    assigns_models: List[LineAssignment] = [LineAssignment(**{str(k): v for k, v in a.items()}) for a in assigns_list]
 
     return OptimizeResponse(
-        trucks=[TruckSummary(**t) for t in trucks_list],
-        assignments=[LineAssignment(**a) for a in assigns_list],
+        trucks=trucks_models,
+        assignments=assigns_models,
         sections=sections,
     )
 
 
 @app.post("/export/trucks")
-async def export_trucks(file: UploadFile = File(...)) -> StreamingResponse:
+async def export_trucks(
+    file: UploadFile = File(...),
+    planningWhse: Optional[str] = Form("ZAC"),
+) -> StreamingResponse:
     """Export optimized truck assignments to Excel format"""
     filename = file.filename or ""
     if not filename.lower().endswith(".xlsx"):
@@ -160,11 +167,16 @@ async def export_trucks(file: UploadFile = File(...)) -> StreamingResponse:
         content: bytes = await file.read()
         buffer = BytesIO(content)
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
-        df = filter_by_planning_whse(df, ("ZAC",))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
+    # Apply Planning Whse filter first (default ZAC); if missing column, no-op
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
     df = compute_calculated_fields(df)
     cfg = {
         "texas_max_lbs": 52000,
@@ -214,239 +226,250 @@ def update_no_multi_stop_customers(customers: List[str]) -> Dict[str, str]:
     return {"message": f"Updated no-multi-stop list with {len(customers)} customers"}
 
 
-@app.post("/combine-trucks", response_model=CombineTrucksResponse)
-async def combine_trucks(
+@app.post("/export/dh-load-list")
+async def export_dh_load_list(
     file: UploadFile = File(...),
-    request: str = Form(...)
-) -> CombineTrucksResponse:
+    plannedDeliveryCol: Optional[str] = Form(None),
+    planningWhse: Optional[str] = Form("ZAC"),
+) -> StreamingResponse:
+    """Export a DH Load List Excel per mapping.
+
+    - Requires the exact Planned Delivery column name via 'plannedDeliveryCol' (prompted by UI)
+    - Inserts blank row between transports and shades data rows light blue (DCE6F1)
+    - Adds hidden blank column C to match provided layout
     """
-    Combine selected lines from multiple trucks into a new optimized truck assignment.
-    This endpoint takes the original file, re-runs optimization, and then applies the manual combination.
-    """
-    filename = file.filename or ""
-    if not filename.lower().endswith(".xlsx"):
-        raise HTTPException(
-            status_code=400, detail="Only .xlsx files are supported")
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
 
     try:
-        # Parse the JSON request from form data
-        try:
-            request_data = json.loads(request)
-            request_obj = CombineTrucksRequest(**request_data)
-        except (json.JSONDecodeError, ValueError) as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid request format: {str(e)}"
-            )
-
-        # Read and process the original file
         content: bytes = await file.read()
         buffer = BytesIO(content)
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
-        df = filter_by_planning_whse(df, ("ZAC",))
-        df = compute_calculated_fields(df)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
-        # Use the provided weight config
-        cfg = {
-            "texas_max_lbs": request_obj.weightConfig.texas_max_lbs,
-            "texas_min_lbs": request_obj.weightConfig.texas_min_lbs,
-            "other_max_lbs": request_obj.weightConfig.other_max_lbs,
-            "other_min_lbs": request_obj.weightConfig.other_min_lbs,
-        }
+    # Apply Planning Whse filter first (default ZAC); if missing column, no-op
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
+    df = compute_calculated_fields(df)
 
-        # Get current optimization results
-        trucks_df, assigns_df = naive_grouping(df, cfg)
+    # Helper: compute next available business day (skip Sat/Sun)
+    def next_business_day() -> Any:
+        d = pd.Timestamp.today().normalize()
+        d = d + pd.Timedelta(days=1)
+        while d.weekday() >= 5:  # 5=Sat, 6=Sun
+            d = d + pd.Timedelta(days=1)
+        # return timezone-naive python datetime for Excel compatibility
+        try:
+            d = d.tz_localize(None)
+        except Exception:
+            pass
+        return d.to_pydatetime()
 
-        # Parse line IDs to extract assignment info (store as plain dicts, not Series)
-        selected_assignments: List[Dict[str, Any]] = []
-        for line_id in request_obj.lineIds:
-            try:
-                # Format: "truckNumber-SO-Line"
-                parts = line_id.split('-', 2)
-                if len(parts) != 3:
-                    raise ValueError(f"Invalid line ID format: {line_id}")
+    # If provided, ensure the column exists; otherwise we'll default per-row
+    has_planned_col = bool(plannedDeliveryCol) and plannedDeliveryCol in df.columns
 
-                truck_num, so, line = parts
-                truck_num = int(truck_num)
+    # Optimize to get trucks and line splits (pieces/weights per transport)
+    cfg = {"texas_max_lbs": 52000, "texas_min_lbs": 47000, "other_max_lbs": 48000, "other_min_lbs": 44000}
+    try:
+        trucks_df, assigns_df = naive_grouping(df.copy(), cfg)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Optimization failed: {exc}") from exc
 
-                # Find the assignment in assigns_df
-                matching_assignments = assigns_df[
-                    (assigns_df['truckNumber'] == truck_num) &
-                    (assigns_df['so'] == so) &
-                    (assigns_df['line'] == line)
+    # Column normalization helpers
+    def norm_key(s: Any) -> str:
+        s = str(s)
+        s = re.sub(r"\s+", " ", s)
+        s = s.strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "", s)
+        return s
+
+    normalized = {norm_key(c): c for c in df.columns}
+
+    def find_col(target: str, contains_ok: bool = True) -> Optional[str]:
+        if target in normalized:
+            return normalized[target]
+        if contains_ok:
+            for nk, orig in normalized.items():
+                if target in nk:
+                    return orig
+        return None
+
+    # Source columns
+    col_type = find_col("type")
+    col_bpcs = find_col("bpcs")  # BPcs totals per input line
+    col_bal_weight = find_col("balweight") or find_col("balanceweight") or find_col("bal weight")
+    col_frm = find_col("frm")
+    col_grd = find_col("grd")
+    col_size = find_col("size")
+    col_width = find_col("width") or "Width"
+    col_lgth = find_col("lgth") or find_col("length")
+    col_trttav = find_col("trttavno", contains_ok=False) or find_col("trttavno")
+    col_latest_due = find_col("latestdue") or "Latest Due"
+    col_customer = find_col("customer", contains_ok=False) or find_col("customer")
+    col_so = find_col("so", contains_ok=False) or "SO"
+    col_line = find_col("line", contains_ok=False) or "Line"
+    whse_col = _find_planning_whse_col(df)
+
+    # Index original rows by (SO, Line)
+    keyed = df.copy()
+    try:
+        keyed["__so_key__"] = keyed[col_so].astype(str)
+        keyed["__line_key__"] = keyed[col_line].astype(str)
+    except Exception:
+        keyed["__so_key__"] = keyed["SO"].astype(str) if "SO" in keyed.columns else pd.Series([None]*len(keyed), dtype="string")
+        keyed["__line_key__"] = keyed["Line"].astype(str) if "Line" in keyed.columns else pd.Series([None]*len(keyed), dtype="string")
+    index_map: Dict[tuple, Dict[str, Any]] = {}
+    for _, r in keyed.iterrows():
+        index_map[(str(r.get("__so_key__")), str(r.get("__line_key__")))] = r.to_dict()
+
+    # Quick truck meta
+    zones_by_truck: Dict[int, Optional[str]] = {}
+    routes_by_truck: Dict[int, Optional[str]] = {}
+    if not trucks_df.empty:
+        for _, trow in trucks_df.iterrows():
+            tnum = int(trow["truckNumber"]) if pd.notna(trow.get("truckNumber")) else None
+            if tnum is None:
+                continue
+            zones_by_truck[tnum] = None if pd.isna(trow.get("zone")) else str(trow.get("zone"))
+            routes_by_truck[tnum] = None if pd.isna(trow.get("route")) else str(trow.get("route"))
+
+    headers = [
+        "Actual Ship", "TR#", "Carrier", "Loaded", "Shipped", "Ship Date", "Customer", "Type",
+        "SO#", "SO Line", "R#", "WHSE", "Zone", "Route", "BPCS", "RPCS", "Bal Weight",
+        "Ready Weight", "Frm", "Grd", "Size", "Width", "Lgth", "D",
+    ]
+
+    rows: List[List[Any]] = []
+    if not assigns_df.empty:
+        for truck_num in sorted(assigns_df["truckNumber"].unique().tolist()):
+            subset = assigns_df[assigns_df["truckNumber"] == truck_num]
+            if subset.empty:
+                continue
+
+            # R# per customer order
+            route_index: Dict[str, int] = {}
+            next_idx = 1
+            for _, a in subset.iterrows():
+                cust = str(a.get("customerName"))
+                if cust not in route_index:
+                    route_index[cust] = next_idx
+                    next_idx += 1
+
+            for _, a in subset.iterrows():
+                so = str(a.get("so"))
+                line = str(a.get("line"))
+                cust = str(a.get("customerName"))
+                src = index_map.get((so, line), {})
+
+                if has_planned_col:
+                    actual_ship = src.get(plannedDeliveryCol)  # type: ignore[index]
+                else:
+                    actual_ship = next_business_day()
+                ship_date = src.get(col_latest_due) if col_latest_due in src else src.get("Latest Due")
+                # Convert pandas/py datetime to timezone-naive python dt for Excel
+                def as_dt(v: Any) -> Any:
+                    if isinstance(v, pd.Timestamp):
+                        try:
+                            # drop timezone if present
+                            if v.tz is not None or getattr(v, 'tzinfo', None) is not None:
+                                v = v.tz_localize(None)
+                        except Exception:
+                            try:
+                                v = v.tz_convert(None)
+                            except Exception:
+                                pass
+                        return v.to_pydatetime()
+                    if isinstance(v, _dt.datetime):
+                        if v.tzinfo is not None:
+                            # make naive
+                            return v.replace(tzinfo=None)
+                        return v
+                    return v
+
+                row = [
+                    as_dt(actual_ship),
+                    int(truck_num),
+                    "Jordan Carriers",
+                    "",
+                    "",
+                    as_dt(ship_date),
+                    cust,
+                    src.get(col_type) if col_type else None,
+                    so,
+                    line,
+                    route_index.get(cust, 1),
+                    src.get(whse_col) if whse_col else None,
+                    zones_by_truck.get(int(truck_num)),
+                    routes_by_truck.get(int(truck_num)),
+                    src.get(col_bpcs) if col_bpcs else None,
+                    int(a.get("piecesOnTransport") or 0),
+                    src.get(col_bal_weight) if col_bal_weight else None,
+                    float(a.get("totalWeight") or 0.0),
+                    src.get(col_frm) if col_frm else None,
+                    src.get(col_grd) if col_grd else None,
+                    src.get(col_size) if col_size else None,
+                    src.get(col_width) if col_width in src else a.get("width"),
+                    src.get(col_lgth) if col_lgth else None,
+                    src.get(col_trttav) if col_trttav else None,
                 ]
+                rows.append(row)
 
-                if matching_assignments.empty:
-                    raise ValueError(
-                        f"Assignment not found for line ID: {line_id}")
+            # blank separator
+            rows.append([None] * len(headers))
 
-                # Convert the matching row (Series) into a plain dict to satisfy
-                # Pydantic response models later.
-                row_dict = matching_assignments.iloc[0].to_dict()
-                selected_assignments.append({str(k): v for k, v in row_dict.items()})
+    # drop trailing blank
+    if rows and all(v is None for v in rows[-1]):
+        rows.pop()
 
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Error parsing line ID '{line_id}': {str(e)}"
-                )
+    # Write workbook with styling
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        out_df = pd.DataFrame(rows, columns=headers)
+        sheet = "DH Load List"
+        out_df.to_excel(writer, sheet_name=sheet, index=False)
 
-        if len(selected_assignments) < 2:
-            raise HTTPException(
-                status_code=400,
-                detail="At least 2 lines must be selected for combination"
-            )
+        ws = writer.sheets[sheet]
+        # Insert hidden blank column C
+        ws.insert_cols(3)
+        ws.cell(row=1, column=3).value = None
+        ws.column_dimensions[get_column_letter(3)].hidden = True
+        # Freeze the header row
+        ws.freeze_panes = "A2"
 
-        # Validate combination rules
-        selected_df = pd.DataFrame(selected_assignments)
+        # Bold header
+        for c in range(1, ws.max_column + 1):
+            ws.cell(row=1, column=c).font = Font(bold=True)
 
-        # Check if all assignments are from the same state
-        states = selected_df['customerState'].unique()
-        if len(states) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot combine lines from different states: {states.tolist()}"
-            )
+        # Shade only separator (blank) rows in light blue; leave data rows unshaded
+        fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+        for r in range(2, ws.max_row + 1):
+            values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+            if all(v in (None, "") for v in values):
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(row=r, column=c).fill = fill
 
-        # Enforce same Zone/Route when present; gather from source trucks
-        zones_by_truck: Dict[int, Optional[str]] = {}
-        routes_by_truck: Dict[int, Optional[str]] = {}
-        if not trucks_df.empty:
-            for _, trow in trucks_df.iterrows():
-                raw_num = trow.get('truckNumber')
-                if pd.isna(raw_num):
-                    continue
-                try:
-                    tnum = int(raw_num)
-                except Exception:
-                    continue
-                zval = trow.get('zone')
-                rval = trow.get('route')
-                zones_by_truck[tnum] = (None if (zval is None or (hasattr(pd, 'isna') and pd.isna(zval))) else str(zval))
-                routes_by_truck[tnum] = (None if (rval is None or (hasattr(pd, 'isna') and pd.isna(rval))) else str(rval))
+        # Apply date format mm/dd/yyy to Actual Ship and Ship Date columns
+        header_to_col: Dict[str, int] = {}
+        for c in range(1, ws.max_column + 1):
+            header_val = ws.cell(row=1, column=c).value
+            if isinstance(header_val, str):
+                header_to_col[header_val.strip()] = c
+        date_fmt = "mm/dd/yyy"
+        for header in ("Actual Ship", "Ship Date"):
+            cidx = header_to_col.get(header)
+            if cidx:
+                for r in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=r, column=cidx)
+                    # Set number format regardless; Excel will apply to date values
+                    cell.number_format = date_fmt
 
-        sel_truck_nums = set(int(x) for x in selected_df['truckNumber'].unique().tolist())
-        sel_zones = {zones_by_truck.get(t) for t in sel_truck_nums}
-        sel_routes = {routes_by_truck.get(t) for t in sel_truck_nums}
-        # Normalize sets by collapsing None-only correctly
-        sel_zones_clean = {z for z in sel_zones if z is not None}
-        sel_routes_clean = {r for r in sel_routes if r is not None}
-        if len(sel_zones_clean) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot combine lines from different zones: {sorted(sel_zones_clean)}"
-            )
-        if len(sel_routes_clean) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot combine lines from different routes: {sorted(sel_routes_clean)}"
-            )
-
-        selected_zone: Optional[str] = next(iter(sel_zones_clean)) if sel_zones_clean else None
-        selected_route: Optional[str] = next(iter(sel_routes_clean)) if sel_routes_clean else None
-
-        # Calculate total weight
-        total_weight = selected_df['totalWeight'].sum()
-        state = states[0]
-        max_weight = cfg["texas_max_lbs"] if state in [
-            'TX', 'Texas'] else cfg["other_max_lbs"]
-
-        if total_weight > max_weight:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Combined weight ({total_weight:,.0f} lbs) exceeds maximum limit ({max_weight:,.0f} lbs) for {state}"
-            )
-
-        # Create new truck assignment
-        # Find next available truck number
-        max_truck_num = trucks_df['truckNumber'].max() if not trucks_df.empty else 0
-        new_truck_number = max_truck_num + 1
-
-        # Get info from first assignment for truck details
-        first_assignment = selected_assignments[0]
-        min_weight = cfg["texas_min_lbs"] if state in [
-            'TX', 'Texas'] else cfg["other_min_lbs"]
-
-        # Calculate aggregated truck stats
-        total_pieces = selected_df['piecesOnTransport'].sum()
-        total_orders = selected_df['so'].nunique()
-        total_lines = len(selected_assignments)
-        max_width = selected_df['width'].max()
-        overwidth_weight = selected_df[selected_df['isOverwidth']]['totalWeight'].sum()
-        percent_overwidth = (overwidth_weight / total_weight * 100) if total_weight > 0 else 0
-        contains_late = selected_df['isLate'].any()
-
-        # Determine priority bucket (use highest priority)
-        priority_bucket = "WithinWindow"  # Default
-
-        # Create customer name for combined truck
-        unique_customers = selected_df['customerName'].unique()
-        if len(unique_customers) == 1:
-            customer_display = unique_customers[0]
-        else:
-            customer_display = f"Multi-Stop ({len(unique_customers)} customers)"
-
-        # Create new truck summary
-        new_truck: Dict[str, Any] = {
-            "truckNumber": int(new_truck_number),
-            "customerName": str(customer_display),
-            "customerAddress": first_assignment.get('customerAddress'),
-            "customerCity": str(first_assignment['customerCity']),
-            "customerState": str(first_assignment['customerState']),
-            "zone": selected_zone,
-            "route": selected_route,
-            "totalWeight": float(total_weight),
-            "minWeight": int(min_weight),
-            "maxWeight": int(max_weight),
-            "totalOrders": int(total_orders),
-            "totalLines": int(total_lines),
-            "totalPieces": int(total_pieces),
-            "maxWidth": float(max_width),
-            "percentOverwidth": float(percent_overwidth),
-            "containsLate": bool(contains_late),
-            "priorityBucket": str(priority_bucket),
-        }
-
-        # Create updated assignments (reassign to new truck)
-        updated_assignments: List[Dict[str, Any]] = []
-        for assignment in selected_assignments:
-            # Ensure we're working with a plain dict and coerce to JSON-serializable types
-            updated_assignment = {str(k): v for k, v in dict(assignment).items()}
-            updated_assignment['truckNumber'] = int(new_truck_number)
-            # Explicit casting for known numeric/boolean fields
-            if 'piecesOnTransport' in updated_assignment:
-                updated_assignment['piecesOnTransport'] = int(updated_assignment['piecesOnTransport'])
-            if 'totalReadyPieces' in updated_assignment:
-                updated_assignment['totalReadyPieces'] = int(updated_assignment['totalReadyPieces'])
-            if 'weightPerPiece' in updated_assignment:
-                updated_assignment['weightPerPiece'] = float(updated_assignment['weightPerPiece'])
-            if 'totalWeight' in updated_assignment:
-                updated_assignment['totalWeight'] = float(updated_assignment['totalWeight'])
-            if 'width' in updated_assignment:
-                updated_assignment['width'] = float(updated_assignment['width'])
-            if 'isOverwidth' in updated_assignment:
-                updated_assignment['isOverwidth'] = bool(updated_assignment['isOverwidth'])
-            if 'isLate' in updated_assignment:
-                updated_assignment['isLate'] = bool(updated_assignment['isLate'])
-            updated_assignments.append(updated_assignment)
-
-        # Remove original trucks from those being combined (if they're now empty)
-        removed_truck_ids = list(set(request_obj.truckIds))
-
-        # Construct typed response models to satisfy validation
-        from .schemas import TruckSummary, LineAssignment
-        return CombineTrucksResponse(
-            success=True,
-            message=f"Successfully combined {len(selected_assignments)} lines into truck #{new_truck_number}",
-            newTruck=TruckSummary(**new_truck),
-            updatedAssignments=[LineAssignment(**a) for a in updated_assignments],
-            removedTruckIds=[int(t) for t in removed_truck_ids]
-        )
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error combining trucks: {str(exc)}"
-        ) from exc
+    output.seek(0)
+    return StreamingResponse(
+        BytesIO(output.read()),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=dh_load_list.xlsx"},
+    )
