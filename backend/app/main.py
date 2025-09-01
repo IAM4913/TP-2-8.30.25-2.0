@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, cast
 import datetime as _dt
 import pandas as pd
 from io import BytesIO
@@ -234,8 +234,8 @@ async def export_dh_load_list(
 ) -> StreamingResponse:
     """Export a DH Load List Excel per mapping.
 
-    - Requires the exact Planned Delivery column name via 'plannedDeliveryCol' (prompted by UI)
-    - Inserts blank row between transports and shades data rows light blue (DCE6F1)
+    - Optional Planned Delivery column via 'plannedDeliveryCol' (UI now defaults to next business day)
+    - Inserts a blue info row between transports (loads) with per-load stats in italics
     - Adds hidden blank column C to match provided layout
     """
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
@@ -344,6 +344,26 @@ async def export_dh_load_list(
     ]
 
     rows: List[List[Any]] = []
+    separator_row_indices: List[int] = []  # indices into `rows` for the blue info rows
+
+    # Build quick lookup for truck metadata
+    trucks_meta: Dict[int, Dict[str, Any]] = {}
+    if not trucks_df.empty:
+        for _, t in trucks_df.iterrows():
+            # Guard against missing/None truckNumber
+            tnum_val = t.get("truckNumber")
+            if tnum_val is None or (hasattr(pd, "isna") and pd.isna(tnum_val)):
+                continue
+            try:
+                tnum = int(tnum_val)
+            except Exception:  # noqa: BLE001
+                continue
+            trucks_meta[tnum] = {
+                "totalWeight": float(t.get("totalWeight") or 0.0),
+                "maxWeight": float(t.get("maxWeight") or 0.0),
+                "containsLate": bool(t.get("containsLate", False)),
+                "maxWidth": float(t.get("maxWidth") or 0.0),
+            }
     if not assigns_df.empty:
         for truck_num in sorted(assigns_df["truckNumber"].unique().tolist()):
             subset = assigns_df[assigns_df["truckNumber"] == truck_num]
@@ -418,12 +438,60 @@ async def export_dh_load_list(
                 ]
                 rows.append(row)
 
-            # blank separator
-            rows.append([None] * len(headers))
+            # Separator/info row (light blue, italic): per-load stats
+            # Compute per-truck stats from assignments as source of truth
+            total_ready_weight = float(subset["totalWeight"].sum()) if "totalWeight" in subset.columns else float(trucks_meta.get(int(truck_num), {}).get("totalWeight", 0.0))
+            meta = trucks_meta.get(int(truck_num), {})
+            max_weight = float(meta.get("maxWeight", 0.0))
+            contains_late = bool(meta.get("containsLate", False)) or (bool(subset.get("isLate").any()) if "isLate" in subset.columns else False)
+            max_width = float(meta.get("maxWidth", 0.0))
+            if "width" in subset.columns:
+                try:
+                    max_width = max(float(x) for x in subset["width"].tolist() if pd.notna(x)) if not subset.empty else max_width
+                except Exception:
+                    pass
+
+            pct_util = (total_ready_weight / max_weight * 100.0) if max_weight > 0 else 0.0
+            late_status = "Late" if contains_late else "On time"
+            overwidth_status = "Overwidth" if max_width > 96 else "Not Overwidth"
+
+            # Start with all Nones, then fill specific columns
+            sep_row = cast(List[Any], [None] * len(headers))
+            try:
+                rpcsi = headers.index("RPCS")
+                sep_row[rpcsi] = late_status
+            except ValueError:
+                pass
+            try:
+                rwi = headers.index("Ready Weight")
+                sep_row[rwi] = round(total_ready_weight, 2)
+            except ValueError:
+                pass
+            try:
+                frmi = headers.index("Frm")
+                sep_row[frmi] = int(max_weight) if max_weight else None
+            except ValueError:
+                pass
+            try:
+                grdi = headers.index("Grd")
+                sep_row[grdi] = f"{pct_util:.1f}%"
+            except ValueError:
+                pass
+            try:
+                widthi = headers.index("Width")
+                sep_row[widthi] = overwidth_status
+            except ValueError:
+                pass
+
+            rows.append(sep_row)
+            separator_row_indices.append(len(rows) - 1)  # 0-based index into rows
 
     # drop trailing blank
-    if rows and all(v is None for v in rows[-1]):
+    if rows and (all(v is None for v in rows[-1]) or (len(separator_row_indices) and separator_row_indices[-1] == len(rows) - 1 and all(v is None for v in rows[-1]))):
+        # If the last row is an all-None separator (shouldn't occur now), drop it and adjust indices
         rows.pop()
+        if separator_row_indices and separator_row_indices[-1] >= len(rows):
+            separator_row_indices.pop()
 
     # Write workbook with styling
     output = BytesIO()
@@ -444,13 +512,15 @@ async def export_dh_load_list(
         for c in range(1, ws.max_column + 1):
             ws.cell(row=1, column=c).font = Font(bold=True)
 
-        # Shade only separator (blank) rows in light blue; leave data rows unshaded
+        # Shade and italicize only the separator/info rows in light blue
         fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
-        for r in range(2, ws.max_row + 1):
-            values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
-            if all(v in (None, "") for v in values):
+        for idx in separator_row_indices:
+            excel_row = 2 + idx  # header is row 1
+            if excel_row <= ws.max_row:
                 for c in range(1, ws.max_column + 1):
-                    ws.cell(row=r, column=c).fill = fill
+                    cell = ws.cell(row=excel_row, column=c)
+                    cell.fill = fill
+                    cell.font = Font(italic=True)
 
         # Apply date format mm/dd/yyy to Actual Ship and Ship Date columns
         header_to_col: Dict[str, int] = {}
@@ -466,6 +536,25 @@ async def export_dh_load_list(
                     cell = ws.cell(row=r, column=cidx)
                     # Set number format regardless; Excel will apply to date values
                     cell.number_format = date_fmt
+
+        # Auto-fit column widths (skip hidden column C)
+        for c in range(1, ws.max_column + 1):
+            if ws.column_dimensions[get_column_letter(c)].hidden:
+                continue
+            max_len = 0
+            for r in range(1, ws.max_row + 1):
+                val = ws.cell(row=r, column=c).value
+                if val is None:
+                    continue
+                sval = val if isinstance(val, str) else str(val)
+                if len(sval) > max_len:
+                    max_len = len(sval)
+            # Add padding, clamp to a reasonable max
+            width = min(max_len + 2, 50)
+            # Ensure a sensible minimum width for key columns
+            if width < 10:
+                width = 10
+            ws.column_dimensions[get_column_letter(c)].width = width
 
     output.seek(0)
     return StreamingResponse(
