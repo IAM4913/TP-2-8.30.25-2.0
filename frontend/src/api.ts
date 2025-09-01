@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { UploadPreviewResponse, OptimizeRequest, OptimizeResponse } from './types';
+import { UploadPreviewResponse, OptimizeResponse, CombineTrucksRequest, CombineTrucksResponse } from './types';
 
 const api = axios.create({
     baseURL: '/api',
@@ -18,7 +18,7 @@ export const uploadPreview = async (file: File): Promise<UploadPreviewResponse> 
     return response.data;
 };
 
-export const optimizeRoutes = async (file: File, request?: OptimizeRequest): Promise<OptimizeResponse> => {
+export const optimizeRoutes = async (file: File): Promise<OptimizeResponse> => {
     const formData = new FormData();
     formData.append('file', file);
 
@@ -33,7 +33,7 @@ export const optimizeRoutes = async (file: File, request?: OptimizeRequest): Pro
     return response.data;
 };
 
-export const exportTrucks = async (file: File, request?: OptimizeRequest): Promise<Blob> => {
+export const exportTrucks = async (file: File): Promise<Blob> => {
     const formData = new FormData();
     formData.append('file', file);
 
@@ -44,6 +44,27 @@ export const exportTrucks = async (file: File, request?: OptimizeRequest): Promi
             'Content-Type': 'multipart/form-data',
         },
         responseType: 'blob',
+    });
+
+    return response.data;
+};
+
+export const combineTrucks = async (
+    file: File,
+    request: CombineTrucksRequest
+): Promise<CombineTrucksResponse> => {
+    // Create FormData for the file and add JSON data as form fields
+    const formData = new FormData();
+    formData.append('file', file);
+
+    // Add the request data as a JSON string in the form
+    // The FastAPI endpoint will need to be modified to handle this
+    formData.append('request', JSON.stringify(request));
+
+    const response = await api.post('/combine-trucks', formData, {
+        headers: {
+            'Content-Type': 'multipart/form-data',
+        },
     });
 
     return response.data;

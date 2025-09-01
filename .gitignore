@@ -139,3 +139,7 @@ output.png
 # But keep example/template files
 !*template*.xlsx
 !*example*.xlsx
+
+# Backend generated files
+backend/_last_optimize.json
+backend/_tmp_input.xlsx

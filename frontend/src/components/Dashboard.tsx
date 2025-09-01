@@ -24,7 +24,7 @@ const Dashboard: React.FC<DashboardProps> = ({
         setError(null);
 
         try {
-            const results = await optimizeRoutes(file, { weightConfig });
+            const results = await optimizeRoutes(file);
             onOptimizeComplete(results);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Optimization failed');

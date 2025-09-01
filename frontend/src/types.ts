@@ -22,6 +22,9 @@ export interface TruckSummary {
     customerAddress?: string;
     customerCity: string;
     customerState: string;
+    // Optional grouping metadata from the input file (if present)
+    zone?: string | null;
+    route?: string | null;
     totalWeight: number;
     minWeight: number;
     maxWeight: number;
@@ -49,6 +52,8 @@ export interface LineAssignment {
     width: number;
     isOverwidth: boolean;
     isLate: boolean;
+    earliestDue?: string | null;
+    latestDue?: string | null;
 }
 
 export interface OptimizeResponse {
@@ -56,3 +61,20 @@ export interface OptimizeResponse {
     assignments: LineAssignment[];
     sections: Record<string, number[]>;
 }
+
+export interface CombineTrucksRequest {
+    truckIds: number[];
+    lineIds: string[];
+    weightConfig: WeightConfig;
+}
+
+export interface CombineTrucksResponse {
+    success: boolean;
+    message: string;
+    newTruck?: TruckSummary;
+    updatedAssignments: LineAssignment[];
+    removedTruckIds: number[];
+}
+
+// For frontend use - use LineAssignment instead of OrderAssignment
+export interface OrderAssignment extends LineAssignment { }

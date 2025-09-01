@@ -1,28 +1,39 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Download, Upload, Eye, Truck, AlertTriangle, Clock, CheckCircle } from 'lucide-react';
 import { exportTrucks } from '../api';
-import { OptimizeResponse, WeightConfig, TruckSummary } from '../types';
+import { OptimizeResponse, TruckSummary } from '../types';
 
 interface TruckResultsProps {
     results: OptimizeResponse;
     file: File;
-    weightConfig: WeightConfig;
     onNewUpload: () => void;
 }
 
 const TruckResults: React.FC<TruckResultsProps> = ({
     results,
     file,
-    weightConfig,
     onNewUpload,
 }) => {
     const [selectedTruck, setSelectedTruck] = useState<number | null>(null);
     const [exporting, setExporting] = useState(false);
 
+    // Helper to calculate utilization safely
+    const calcUtilization = (truck: TruckSummary) => {
+        if (!truck || !truck.maxWeight) return 0;
+        return (truck.totalWeight / truck.maxWeight) * 100;
+    };
+
+    // Quick lookup for trucks by number
+    const trucksByNumber = useMemo(() => {
+        const map = new Map<number, TruckSummary>();
+        for (const t of results.trucks) map.set(t.truckNumber, t);
+        return map;
+    }, [results.trucks]);
+
     const handleExport = async () => {
         setExporting(true);
         try {
-            const blob = await exportTrucks(file, { weightConfig });
+            const blob = await exportTrucks(file);
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -63,7 +74,7 @@ const TruckResults: React.FC<TruckResultsProps> = ({
     };
 
     const getUtilizationColor = (truck: TruckSummary) => {
-        const utilization = (truck.totalWeight / truck.maxWeight) * 100;
+        const utilization = calcUtilization(truck);
         if (utilization >= 90) return 'text-green-600 bg-green-50';
         if (utilization >= 80) return 'text-yellow-600 bg-yellow-50';
         return 'text-red-600 bg-red-50';
@@ -118,48 +129,48 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                     </div>
 
                                     <div className="space-y-2">
-                                        {truckNumbers.map(truckNum => {
-                                            const truck = results.trucks.find(t => t.truckNumber === truckNum);
-                                            if (!truck) return null;
+                                        {truckNumbers
+                                            .map((truckNum) => trucksByNumber.get(truckNum))
+                                            .filter((t): t is TruckSummary => Boolean(t))
+                                            .sort((a, b) => calcUtilization(b) - calcUtilization(a))
+                                            .map((truck) => {
+                                                const utilization = calcUtilization(truck).toFixed(1);
 
-                                            const utilization = ((truck.totalWeight / truck.maxWeight) * 100).toFixed(1);
-
-                                            return (
-                                                <div
-                                                    key={truck.truckNumber}
-                                                    onClick={() => setSelectedTruck(truck.truckNumber)}
-                                                    className={`p-3 rounded-lg border cursor-pointer hover:bg-gray-50 ${selectedTruck === truck.truckNumber ? 'border-blue-500 bg-blue-50' : 'border-gray-200'
-                                                        }`}
-                                                >
-                                                    <div className="flex items-center justify-between">
-                                                        <div className="flex items-center">
-                                                            <Truck className="h-4 w-4 text-gray-500 mr-2" />
-                                                            <span className="font-medium">Truck {truck.truckNumber}</span>
-                                                            <span className="ml-2 text-sm text-gray-600">
-                                                                {truck.customerName} - {truck.customerCity}, {truck.customerState}
-                                                            </span>
+                                                return (
+                                                    <div
+                                                        key={truck.truckNumber}
+                                                        onClick={() => setSelectedTruck(truck.truckNumber)}
+                                                        className={`p-3 rounded-lg border cursor-pointer hover:bg-gray-50 ${selectedTruck === truck.truckNumber ? 'border-blue-500 bg-blue-50' : 'border-gray-200'}`}
+                                                    >
+                                                        <div className="flex items-center justify-between">
+                                                            <div className="flex items-center">
+                                                                <Truck className="h-4 w-4 text-gray-500 mr-2" />
+                                                                <span className="font-medium">Truck {truck.truckNumber}</span>
+                                                                <span className="ml-2 text-sm text-gray-600">
+                                                                    {truck.customerName} - {truck.customerCity}, {truck.customerState}
+                                                                </span>
+                                                            </div>
+                                                            <div className="flex items-center space-x-3">
+                                                                <span className={`px-2 py-1 rounded text-xs font-medium ${getUtilizationColor(truck)}`}>
+                                                                    {utilization}%
+                                                                </span>
+                                                                <span className="text-sm text-gray-500">
+                                                                    {truck.totalWeight.toLocaleString()} lbs
+                                                                </span>
+                                                                {truck.containsLate && (
+                                                                    <AlertTriangle className="h-4 w-4 text-red-500" />
+                                                                )}
+                                                            </div>
                                                         </div>
-                                                        <div className="flex items-center space-x-3">
-                                                            <span className={`px-2 py-1 rounded text-xs font-medium ${getUtilizationColor(truck)}`}>
-                                                                {utilization}%
-                                                            </span>
-                                                            <span className="text-sm text-gray-500">
-                                                                {truck.totalWeight.toLocaleString()} lbs
-                                                            </span>
-                                                            {truck.containsLate && (
-                                                                <AlertTriangle className="h-4 w-4 text-red-500" />
-                                                            )}
+
+                                                        <div className="mt-2 text-xs text-gray-500 grid grid-cols-3 gap-4">
+                                                            <span>{truck.totalOrders} orders</span>
+                                                            <span>{truck.totalLines} lines</span>
+                                                            <span>{truck.totalPieces.toLocaleString()} pieces</span>
                                                         </div>
                                                     </div>
-
-                                                    <div className="mt-2 text-xs text-gray-500 grid grid-cols-3 gap-4">
-                                                        <span>{truck.totalOrders} orders</span>
-                                                        <span>{truck.totalLines} lines</span>
-                                                        <span>{truck.totalPieces.toLocaleString()} pieces</span>
-                                                    </div>
-                                                </div>
-                                            );
-                                        })}
+                                                );
+                                            })}
                                     </div>
                                 </div>
                             ))}
@@ -181,7 +192,7 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                         <div className="p-6">
                             {selectedTruck ? (
                                 <div className="space-y-4">
-                                    {selectedTruckAssignments.map((assignment, index) => (
+                                    {selectedTruckAssignments.map((assignment) => (
                                         <div key={`${assignment.so}-${assignment.line}`} className="border-b border-gray-100 pb-3">
                                             <div className="flex justify-between items-start mb-2">
                                                 <div>
@@ -196,14 +207,30 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                                 </div>
                                             </div>
 
-                                            <div className="flex items-center space-x-4 text-xs text-gray-500">
-                                                <span>{assignment.width}" wide</span>
-                                                {assignment.isOverwidth && (
-                                                    <span className="text-orange-600 font-medium">Overwidth</span>
-                                                )}
-                                                {assignment.isLate && (
-                                                    <span className="text-red-600 font-medium">Late</span>
-                                                )}
+                                            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between text-xs text-gray-500 gap-1">
+                                                <div className="flex items-center gap-4">
+                                                    <span>{assignment.width}" wide</span>
+                                                    {assignment.isOverwidth && (
+                                                        <span className="text-orange-600 font-medium">Overwidth</span>
+                                                    )}
+                                                    {assignment.isLate && (
+                                                        <span className="text-red-600 font-medium">Late</span>
+                                                    )}
+                                                </div>
+                                                <div className="flex items-center gap-4">
+                                                    {assignment.earliestDue && (
+                                                        <div className="flex flex-col leading-tight">
+                                                            <span className="uppercase text-[10px] text-gray-400 tracking-wide">Earliest</span>
+                                                            <span className="text-gray-700">{new Date(assignment.earliestDue).toLocaleDateString()}</span>
+                                                        </div>
+                                                    )}
+                                                    {assignment.latestDue && (
+                                                        <div className="flex flex-col leading-tight">
+                                                            <span className="uppercase text-[10px] text-gray-400 tracking-wide">Latest</span>
+                                                            <span className="text-gray-700">{new Date(assignment.latestDue).toLocaleDateString()}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
                                             </div>
                                         </div>
                                     ))}

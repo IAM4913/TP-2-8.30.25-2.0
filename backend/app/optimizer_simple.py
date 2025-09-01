@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
 from collections import defaultdict
 from .excel_utils import build_priority_bucket
+import re
 
 # Customers that cannot be combined with other customers on same truck
 NO_MULTI_STOP_CUSTOMERS = [
@@ -58,9 +59,37 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
     if missing:
         raise ValueError(f"Missing columns for optimization: {missing}")
 
+    # Normalize optional grouping headers case-insensitively (Zone/Route), be robust to whitespace and variants
+    def norm_key(s: Any) -> str:
+        s = str(s)
+        s = re.sub(r"\s+", " ", s)
+        s = s.strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "", s)
+        return s
+
+    df = df.copy()
+    normalized = {norm_key(c): c for c in df.columns}
+
+    def find_col(target: str, contains_ok: bool = True) -> Optional[str]:
+        # prefer exact first
+        if target in normalized:
+            return normalized[target]
+        if contains_ok:
+            # find any column whose normalized key contains target
+            for nk, orig in normalized.items():
+                if target in nk:
+                    return orig
+        return None
+
+    zone_src = find_col('zone')
+    route_src = find_col('route')
+    if zone_src is not None and 'Zone' not in df.columns:
+        df['Zone'] = df[zone_src]
+    if route_src is not None and 'Route' not in df.columns:
+        df['Route'] = df[route_src]
+
     # Determine per-piece weight; fallback evenly if missing
     per_piece = df.get("Weight Per Piece")
-    df = df.copy()
     if per_piece is None or per_piece.isna().all():
         # fallback: assume uniform split across pieces
         df["Weight Per Piece"] = df["Ready Weight"] / \
@@ -103,6 +132,8 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
         customer = group["Customer"].iloc[0]
         state = group["shipping_state"].iloc[0]
         city = group["shipping_city"].iloc[0]
+        zone_val = group["Zone"].iloc[0] if "Zone" in group.columns else None
+        route_val = group["Route"].iloc[0] if "Route" in group.columns else None
 
         max_weight = weight_config["texas_max_lbs"] if is_texas(
             str(state)) else weight_config["other_max_lbs"]
@@ -115,11 +146,11 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
         current_lines = 0
         max_width = 0.0
         contains_late = False
-        bucket = None
+        has_near_due = False
         pending_assignments = []
 
         def finalize_truck():
-            nonlocal truck_counter, current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, bucket, pending_assignments
+            nonlocal truck_counter, current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, has_near_due, pending_assignments
             if current_weight == 0:
                 return
             truck_counter += 1
@@ -128,12 +159,22 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             percent_overwidth = float(
                 overwidth_weight / current_weight * 100.0) if current_weight > 0 else 0.0
 
+            # Determine worst-case priority for the truck
+            if contains_late:
+                priority_bucket = "Late"
+            elif has_near_due:
+                priority_bucket = "NearDue"
+            else:
+                priority_bucket = "WithinWindow"
+
             truck_rows.append({
                 "truckNumber": truck_counter,
                 "customerName": str(customer),
-                "customerAddress": group.get("shipping_address_1").iloc[0] if "shipping_address_1" in group.columns and not group.empty else None,
+                "customerAddress": group["shipping_address_1"].iloc[0] if "shipping_address_1" in group.columns and not group.empty else None,
                 "customerCity": str(city),
                 "customerState": str(state),
+                "zone": None if pd.isna(zone_val) else str(zone_val),
+                "route": None if pd.isna(route_val) else str(route_val),
                 "totalWeight": float(current_weight),
                 "minWeight": int(min_weight),
                 "maxWeight": int(max_weight),
@@ -143,7 +184,7 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                 "maxWidth": float(max_width),
                 "percentOverwidth": float(percent_overwidth),
                 "containsLate": bool(contains_late),
-                "priorityBucket": bucket or "WithinWindow",
+                "priorityBucket": priority_bucket,
             })
             for a in pending_assignments:
                 a = a.copy()
@@ -156,7 +197,7 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             current_lines = 0
             max_width = 0.0
             contains_late = False
-            bucket = None
+            has_near_due = False
             pending_assignments = []
 
         for _, row in group.iterrows():
@@ -169,7 +210,9 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             line_total_weight = float(row.get("Ready Weight") or 0.0)
             line_is_overwidth = bool(width > 96)
             line_is_late = bool(row.get("Is Late", False))
-            bucket = bucket or str(row.get("priorityBucket", "WithinWindow"))
+            row_bucket = str(row.get("priorityBucket", "WithinWindow"))
+            if row_bucket == "NearDue":
+                has_near_due = True
 
             # If the full line won't fit, split by pieces
             needed_weight = line_total_weight
@@ -199,6 +242,12 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             max_width = max(max_width, width)
             contains_late = contains_late or line_is_late
 
+            # Safely serialize due dates
+            _earliest = row.get("Earliest Due")
+            _latest = row.get("Latest Due")
+            earliest_serial = _earliest.isoformat() if isinstance(_earliest, pd.Timestamp) and pd.notna(_earliest) else None
+            latest_serial = _latest.isoformat() if isinstance(_latest, pd.Timestamp) and pd.notna(_latest) else None
+
             pending_assignments.append({
                 "so": str(row.get("SO")),
                 "line": str(row.get("Line")),
@@ -213,6 +262,8 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                 "width": float(width),
                 "isOverwidth": bool(line_is_overwidth),
                 "isLate": bool(line_is_late),
+                "earliestDue": earliest_serial,
+                "latestDue": latest_serial,
             })
 
             # If we hit/exceed the max, finalize
