@@ -546,7 +546,21 @@ async def export_dh_load_list(
                 "maxWidth": float(t.get("maxWidth") or 0.0),
             }
     if not assigns_df.empty:
-        for truck_num in sorted(assigns_df["truckNumber"].unique().tolist()):
+        # Determine sort order by percent utilization (descending)
+        util_by_truck: Dict[int, float] = {}
+        for tnum in assigns_df["truckNumber"].unique().tolist():
+            try:
+                tnum_i = int(tnum)
+            except Exception:
+                continue
+            subset_tmp = assigns_df[assigns_df["truckNumber"] == tnum_i]
+            total_ready_weight_tmp = float(subset_tmp["totalWeight"].sum()) if "totalWeight" in subset_tmp.columns else float(trucks_meta.get(int(tnum_i), {}).get("totalWeight", 0.0))
+            max_weight_tmp = float(trucks_meta.get(int(tnum_i), {}).get("maxWeight", 0.0))
+            util_by_truck[tnum_i] = (total_ready_weight_tmp / max_weight_tmp) if max_weight_tmp > 0 else 0.0
+
+        sorted_trucks = sorted(util_by_truck.keys(), key=lambda k: util_by_truck.get(k, 0.0), reverse=True)
+
+        for truck_num in sorted_trucks:
             subset = assigns_df[assigns_df["truckNumber"] == truck_num]
             if subset.empty:
                 continue
@@ -624,7 +638,7 @@ async def export_dh_load_list(
             total_ready_weight = float(subset["totalWeight"].sum()) if "totalWeight" in subset.columns else float(trucks_meta.get(int(truck_num), {}).get("totalWeight", 0.0))
             meta = trucks_meta.get(int(truck_num), {})
             max_weight = float(meta.get("maxWeight", 0.0))
-            contains_late = bool(meta.get("containsLate", False)) or (bool(subset.get("isLate").any()) if "isLate" in subset.columns else False)
+            contains_late = bool(meta.get("containsLate", False)) or (bool(subset["isLate"].any()) if "isLate" in subset.columns else False)
             max_width = float(meta.get("maxWidth", 0.0))
             if "width" in subset.columns:
                 try:
