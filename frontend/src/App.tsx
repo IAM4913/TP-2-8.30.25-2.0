@@ -106,15 +106,15 @@ function App() {
                     const containsLate = tAssigns.some(a => a.isLate);
                     const bucket = containsLate ? 'Late' : 'WithinWindow';
                     const prev = trucksById.get(truckId);
-            const updated = {
+                    const updated = {
                         ...(prev || {
                             truckNumber: truckId,
                             customerName: any.customerName,
                             customerAddress: undefined,
                             customerCity: any.customerCity,
                             customerState: any.customerState,
-                zone: (prev as any)?.zone ?? null,
-                route: (prev as any)?.route ?? null,
+                            zone: (prev as any)?.zone ?? null,
+                            route: (prev as any)?.route ?? null,
                         }),
                         totalWeight,
                         minWeight: min,

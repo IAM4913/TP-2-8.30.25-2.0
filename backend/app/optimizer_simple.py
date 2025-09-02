@@ -255,6 +255,8 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                 "customerAddress": row.get("shipping_address_1"),
                 "customerCity": str(row.get("shipping_city")),
                 "customerState": str(row.get("shipping_state")),
+                "zone": None if pd.isna(zone_val) else str(zone_val),
+                "route": None if pd.isna(route_val) else str(route_val),
                 "piecesOnTransport": int(take_pieces),
                 "totalReadyPieces": int(pieces),
                 "weightPerPiece": float(weight_per_piece),
@@ -262,6 +264,7 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                 "width": float(width),
                 "isOverwidth": bool(line_is_overwidth),
                 "isLate": bool(line_is_late),
+                "priorityBucket": str(row_bucket),
                 "earliestDue": earliest_serial,
                 "latestDue": latest_serial,
             })
@@ -275,4 +278,211 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
 
     trucks_df = pd.DataFrame(truck_rows)
     assigns_df = pd.DataFrame(assignment_rows)
+
+    # --- Cross-bucket fill step ---
+    # Top off Late trucks using NearDue/WithinWindow; then NearDue using WithinWindow.
+    # Constraints: Planning Whse already filtered upstream; require exact match on
+    # Zone, Route, Customer, City, State (i.e., trucks with identical summary context).
+    # Respect maxWeight and do not split assignment fragments further.
+    def _truck_group_key(trow: pd.Series) -> tuple:
+        return (
+            (None if pd.isna(trow.get("zone")) else str(trow.get("zone"))),
+            (None if pd.isna(trow.get("route")) else str(trow.get("route"))),
+            str(trow.get("customerName")),
+            str(trow.get("customerState")),
+            str(trow.get("customerCity")),
+        )
+
+    if not trucks_df.empty and not assigns_df.empty:
+        def _to_int_or_none(v: Any) -> Optional[int]:
+            try:
+                if v is None or (hasattr(pd, 'isna') and pd.isna(v)):
+                    return None
+                return int(v)
+            except Exception:
+                try:
+                    return int(float(v))
+                except Exception:
+                    try:
+                        s = str(v)
+                        return int(s)
+                    except Exception:
+                        return None
+        # Map truck -> group key
+        trucks_df = trucks_df.copy()
+        assigns_df = assigns_df.copy()
+
+        # Ensure expected columns
+        if "priorityBucket" not in assigns_df.columns:
+            # Derive from isLate when missing
+            if "isLate" in assigns_df.columns:
+                assigns_df["priorityBucket"] = assigns_df["isLate"].map(lambda x: "Late" if bool(x) else "WithinWindow")
+            else:
+                assigns_df["priorityBucket"] = "WithinWindow"
+
+        # Build quick access
+        def rebuild_truck_summaries(from_assigns: pd.DataFrame) -> pd.DataFrame:
+            if from_assigns.empty:
+                return pd.DataFrame(columns=list(trucks_df.columns))
+            # Aggregate by truckNumber
+            agg = []
+            for tnum, g in from_assigns.groupby("truckNumber"):
+                tnum_i = _to_int_or_none(tnum)
+                if tnum_i is None:
+                    continue
+                # Get meta from any original truck row if available
+                base = trucks_df[trucks_df["truckNumber"] == tnum_i]
+                if base.empty:
+                    # construct minimal via first row of assignments
+                    any_row = g.iloc[0]
+                    zone_val = None
+                    route_val = None
+                    customer = str(any_row.get("customerName"))
+                    city = str(any_row.get("customerCity"))
+                    state = str(any_row.get("customerState"))
+                else:
+                    brow = base.iloc[0]
+                    zone_val = None if pd.isna(brow.get("zone")) else str(brow.get("zone"))
+                    route_val = None if pd.isna(brow.get("route")) else str(brow.get("route"))
+                    customer = str(brow.get("customerName"))
+                    city = str(brow.get("customerCity"))
+                    state = str(brow.get("customerState"))
+
+                is_tx = is_texas(state)
+                max_weight = weight_config["texas_max_lbs"] if is_tx else weight_config["other_max_lbs"]
+                min_weight = weight_config["texas_min_lbs"] if is_tx else weight_config["other_min_lbs"]
+                total_weight = float(g["totalWeight"].sum())
+                total_pieces = int(g["piecesOnTransport"].sum()) if "piecesOnTransport" in g.columns else int(len(g))
+                total_lines = int(g.shape[0])
+                total_orders = int(g["so"].nunique()) if "so" in g.columns else total_lines
+                max_width = float(g["width"].max()) if "width" in g.columns and not g.empty else 0.0
+                contains_late = bool((g.get("isLate") == True).any()) if "isLate" in g.columns else False
+                # Determine truck bucket by assignment priority buckets
+                priority_bucket = "WithinWindow"
+                if "priorityBucket" in g.columns:
+                    vals = g["priorityBucket"].dropna().astype(str).tolist()
+                    if any(v == "Late" for v in vals):
+                        priority_bucket = "Late"
+                    elif any(v == "NearDue" for v in vals):
+                        priority_bucket = "NearDue"
+
+                agg.append({
+                    "truckNumber": int(tnum_i),
+                    "customerName": customer,
+                    "customerAddress": None,
+                    "customerCity": city,
+                    "customerState": state,
+                    "zone": zone_val,
+                    "route": route_val,
+                    "totalWeight": float(total_weight),
+                    "minWeight": int(min_weight),
+                    "maxWeight": int(max_weight),
+                    "totalOrders": int(total_orders),
+                    "totalLines": int(total_lines),
+                    "totalPieces": int(total_pieces),
+                    "maxWidth": float(max_width),
+                    "percentOverwidth": float(0.0),
+                    "containsLate": bool(contains_late),
+                    "priorityBucket": str(priority_bucket),
+                })
+            return pd.DataFrame(agg)
+
+        # Helper to run a single fill pass: fill_buckets is target list, donor_buckets are allowed donors
+        def fill_pass(target_buckets: set, donor_buckets: set):
+            nonlocal assigns_df, trucks_df
+            # Recompute summary each pass for up-to-date weights
+            trucks_local = rebuild_truck_summaries(assigns_df)
+            if trucks_local.empty:
+                return
+            # Build group -> trucks within
+            groups: Dict[tuple, Dict[str, List[int]]] = defaultdict(lambda: {"targets": [], "donors": []})
+            for _, trow in trucks_local.iterrows():
+                tnum = int(trow["truckNumber"]) if pd.notna(trow.get("truckNumber")) else None
+                if tnum is None:
+                    continue
+                gk = _truck_group_key(trow)
+                bucket = str(trow.get("priorityBucket", "WithinWindow"))
+                if bucket in target_buckets:
+                    groups[gk]["targets"].append(tnum)
+                if bucket in donor_buckets:
+                    groups[gk]["donors"].append(tnum)
+
+            # For each group, try to move assignment rows from donors to targets
+            for gk, d in groups.items():
+                targets = d["targets"]
+                donors = d["donors"]
+                if not targets or not donors:
+                    continue
+                # Work on local views to avoid repeated filtering
+                for t_truck in targets:
+                    # Get latest summary for target
+                    t_summary = rebuild_truck_summaries(assigns_df)
+                    t_row = t_summary[t_summary["truckNumber"] == t_truck]
+                    if t_row.empty:
+                        continue
+                    t_row = t_row.iloc[0]
+                    t_weight = float(t_row.get("totalWeight") or 0.0)
+                    t_min = float(t_row.get("minWeight") or 0.0)
+                    t_max = float(t_row.get("maxWeight") or 0.0)
+                    if t_weight >= t_min or t_weight >= t_max * 0.98:
+                        continue
+                    # Iterate donors; prefer donors with same group and lower priority bucket first
+                    for d_truck in list(donors):
+                        if d_truck == t_truck:
+                            continue
+                        # Candidate rows from donor matching this exact group key
+                        zone_key, route_key, cust_key, state_key, city_key = gk
+                        cand = assigns_df[(assigns_df["truckNumber"] == d_truck)]
+                        # Ensure zone/route columns exist on assignments
+                        if "zone" not in cand.columns:
+                            cand["zone"] = None
+                        if "route" not in cand.columns:
+                            cand["route"] = None
+                        # Build boolean mask for exact match (with None handling)
+                        def _eq_or_none(series, key):
+                            if key is None:
+                                return series.isna() | (series.astype(object) == None)  # noqa: E711
+                            return series.astype(str) == str(key)
+                        mask = (
+                            _eq_or_none(cand["zone"], zone_key)
+                            & _eq_or_none(cand["route"], route_key)
+                            & (cand["customerName"].astype(str) == str(cust_key))
+                            & (cand["customerState"].astype(str) == str(state_key))
+                            & (cand["customerCity"].astype(str) == str(city_key))
+                        )
+                        cand = cand[mask]
+                        if cand.empty:
+                            continue
+                        # Move rows one by one while capacity allows
+                        moved_any = False
+                        for ridx, arow in cand.iterrows():
+                            w = float(arow.get("totalWeight") or 0.0)
+                            if w <= 0:
+                                continue
+                            if (t_weight + w) <= (t_max * 1.0001):
+                                # Reassign
+                                assigns_df.at[ridx, "truckNumber"] = t_truck
+                                t_weight += w
+                                moved_any = True
+                                # Stop if we reached min weight or close to max
+                                if t_weight >= t_min or t_weight >= t_max * 0.98:
+                                    break
+                        # Remove donor from list if emptied
+                        rem_count = assigns_df[assigns_df["truckNumber"] == d_truck].shape[0]
+                        if rem_count == 0:
+                            try:
+                                donors.remove(d_truck)
+                            except ValueError:
+                                pass
+                        if t_weight >= t_min or t_weight >= t_max * 0.98:
+                            break
+
+        # Pass 1: Late <- NearDue or WithinWindow
+        fill_pass(target_buckets={"Late"}, donor_buckets={"NearDue", "WithinWindow"})
+        # Pass 2: NearDue <- WithinWindow
+        fill_pass(target_buckets={"NearDue"}, donor_buckets={"WithinWindow"})
+
+        # Rebuild final summaries after reassignment
+        trucks_df = rebuild_truck_summaries(assigns_df)
+
     return trucks_df, assigns_df

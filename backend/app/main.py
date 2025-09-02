@@ -7,7 +7,7 @@ import datetime as _dt
 import pandas as pd
 from io import BytesIO
 import re
-from openpyxl.styles import PatternFill, Font
+from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from .schemas import (
     UploadPreviewResponse,
@@ -450,8 +450,67 @@ async def export_dh_load_list(
             pass
         return d.to_pydatetime()
 
-    # If provided, ensure the column exists; otherwise we'll default per-row
-    has_planned_col = bool(plannedDeliveryCol) and plannedDeliveryCol in df.columns
+    # Helper: normalize pandas/python datetimes to timezone-naive python datetime
+    def as_dt(v: Any) -> Any:
+        if isinstance(v, pd.Timestamp):
+            try:
+                if v.tz is not None or getattr(v, 'tzinfo', None) is not None:
+                    v = v.tz_localize(None)
+            except Exception:
+                try:
+                    v = v.tz_convert(None)
+                except Exception:
+                    pass
+            return v.to_pydatetime()
+        if isinstance(v, _dt.datetime):
+            return v.replace(tzinfo=None) if v.tzinfo is not None else v
+        return v
+
+    # Helper: next business day after a given date (skip Sat/Sun)
+    def next_business_day_after(value: Any) -> _dt.datetime:
+        try:
+            ts = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            ts = pd.NaT
+        if pd.isna(ts):
+            return next_business_day()
+        try:
+            ts = ts.tz_localize(None)
+        except Exception:
+            try:
+                ts = ts.tz_convert(None)
+            except Exception:
+                pass
+        ts = ts + pd.Timedelta(days=1)
+        while ts.weekday() >= 5:
+            ts = ts + pd.Timedelta(days=1)
+        return ts.to_pydatetime()
+
+    # Helper: add N business days to a given date (skip Sat/Sun)
+    def add_business_days(start: Any, days: int) -> _dt.datetime:
+        try:
+            ts = pd.to_datetime(start, errors="coerce")
+        except Exception:
+            ts = pd.NaT
+        if pd.isna(ts):
+            ts = pd.Timestamp.today().normalize()
+        try:
+            ts = ts.tz_localize(None)
+        except Exception:
+            try:
+                ts = ts.tz_convert(None)
+            except Exception:
+                pass
+        remaining = int(days or 0)
+        step = 1 if remaining >= 0 else -1
+        while remaining != 0:
+            ts = ts + pd.Timedelta(days=step)
+            if ts.weekday() < 5:
+                remaining -= step
+        return ts.to_pydatetime()
+
+    # Planned Delivery column no longer drives Actual Ship; logic is per-load as specified
+    has_planned_col = False
 
     # Optimize to get trucks and line splits (pieces/weights per transport)
     cfg = {"texas_max_lbs": 52000, "texas_min_lbs": 47000, "other_max_lbs": 48000, "other_min_lbs": 44000}
@@ -489,7 +548,10 @@ async def export_dh_load_list(
     col_width = find_col("width") or "Width"
     col_lgth = find_col("lgth") or find_col("length")
     col_trttav = find_col("trttavno", contains_ok=False) or find_col("trttavno")
+    # Exact 'R' column from input for R# mapping
+    col_r = find_col("r", contains_ok=False)
     col_latest_due = find_col("latestdue") or "Latest Due"
+    col_earliest_due_src = find_col("earliestdue") or "Earliest Due"
     col_customer = find_col("customer", contains_ok=False) or find_col("customer")
     col_so = find_col("so", contains_ok=False) or "SO"
     col_line = find_col("line", contains_ok=False) or "Line"
@@ -521,11 +583,8 @@ async def export_dh_load_list(
     headers = [
         "Actual Ship", "TR#", "Carrier", "Loaded", "Shipped", "Ship Date", "Customer", "Type",
         "SO#", "SO Line", "R#", "WHSE", "Zone", "Route", "BPCS", "RPCS", "Bal Weight",
-        "Ready Weight", "Frm", "Grd", "Size", "Width", "Lgth", "D",
+        "Ready Weight", "Frm", "Grd", "Size", "Width", "Lgth", "D", "PRV",
     ]
-
-    rows: List[List[Any]] = []
-    separator_row_indices: List[int] = []  # indices into `rows` for the blue info rows
 
     # Build quick lookup for truck metadata
     trucks_meta: Dict[int, Dict[str, Any]] = {}
@@ -545,68 +604,114 @@ async def export_dh_load_list(
                 "containsLate": bool(t.get("containsLate", False)),
                 "maxWidth": float(t.get("maxWidth") or 0.0),
             }
+    # Map truck -> priority bucket based on its assignments
+    bucket_by_truck: Dict[int, str] = {}
     if not assigns_df.empty:
-        # Determine sort order by percent utilization (descending)
-        util_by_truck: Dict[int, float] = {}
         for tnum in assigns_df["truckNumber"].unique().tolist():
             try:
                 tnum_i = int(tnum)
             except Exception:
                 continue
             subset_tmp = assigns_df[assigns_df["truckNumber"] == tnum_i]
-            total_ready_weight_tmp = float(subset_tmp["totalWeight"].sum()) if "totalWeight" in subset_tmp.columns else float(trucks_meta.get(int(tnum_i), {}).get("totalWeight", 0.0))
-            max_weight_tmp = float(trucks_meta.get(int(tnum_i), {}).get("maxWeight", 0.0))
-            util_by_truck[tnum_i] = (total_ready_weight_tmp / max_weight_tmp) if max_weight_tmp > 0 else 0.0
-
-        sorted_trucks = sorted(util_by_truck.keys(), key=lambda k: util_by_truck.get(k, 0.0), reverse=True)
-
-        for truck_num in sorted_trucks:
+            bucket_val = "WithinWindow"
+            if "priorityBucket" in subset_tmp.columns:
+                vals = subset_tmp["priorityBucket"].dropna().astype(str).tolist()
+                if any(v == "Late" for v in vals):
+                    bucket_val = "Late"
+                elif any(v == "NearDue" for v in vals):
+                    bucket_val = "NearDue"
+            elif "isLate" in subset_tmp.columns and bool(subset_tmp["isLate"].any()):
+                bucket_val = "Late"
+            bucket_by_truck[tnum_i] = bucket_val
+    # Helper to build rows for a given ordered list of trucks
+    def build_rows_for(truck_order: List[int]) -> tuple[List[List[Any]], List[int], List[float]]:
+        rows_local: List[List[Any]] = []
+        sep_indices: List[int] = []
+        sep_utils: List[float] = []
+        def to_int(v: Any) -> Optional[int]:
+            try:
+                if v is None or (hasattr(pd, 'isna') and pd.isna(v)):
+                    return None
+                return int(float(v))
+            except Exception:
+                return None
+        def to_float(v: Any) -> Optional[float]:
+            try:
+                if v is None or (hasattr(pd, 'isna') and pd.isna(v)):
+                    return None
+                return float(v)
+            except Exception:
+                return None
+        for truck_num in truck_order:
             subset = assigns_df[assigns_df["truckNumber"] == truck_num]
             if subset.empty:
                 continue
-
-            # R# per customer order
-            route_index: Dict[str, int] = {}
-            next_idx = 1
-            for _, a in subset.iterrows():
-                cust = str(a.get("customerName"))
-                if cust not in route_index:
-                    route_index[cust] = next_idx
-                    next_idx += 1
-
+            # Compute per-load Actual Ship per rules:
+            # - If any line is Late -> next business day
+            # - Else -> day after latest Earliest Due among lines in this load
+            contains_late_subset = bool(subset["isLate"].any()) if "isLate" in subset.columns else False
+            if contains_late_subset:
+                truck_actual_ship = as_dt(next_business_day())
+            else:
+                # Prefer assignments_df 'earliestDue'
+                ed_series = None
+                if "earliestDue" in subset.columns:
+                    try:
+                        ed_series = pd.to_datetime(subset["earliestDue"], errors="coerce")
+                    except Exception:
+                        ed_series = None
+                # Fallback to source 'Earliest Due' via index_map
+                if ed_series is None or ed_series.dropna().empty:
+                    ed_vals: list = []
+                    for _, arow in subset.iterrows():
+                        so = str(arow.get("so"))
+                        line = str(arow.get("line"))
+                        src = index_map.get((so, line), {})
+                        ed_vals.append(src.get(col_earliest_due_src))
+                    try:
+                        ed_series = pd.to_datetime(pd.Series(ed_vals), errors="coerce")
+                    except Exception:
+                        ed_series = pd.Series([], dtype="datetime64[ns]")
+                if ed_series.dropna().empty:
+                    # No usable earliest due; default to next business day
+                    truck_actual_ship = as_dt(next_business_day())
+                else:
+                    max_ed = ed_series.max()
+                    # Next business day after max earliest due
+                    truck_actual_ship = next_business_day_after(max_ed)
+                    # If this date is in the past, move it 3 business days into the future from today
+                    try:
+                        tas = pd.to_datetime(truck_actual_ship, errors="coerce")
+                        today = pd.Timestamp.today().normalize()
+                        if pd.notna(tas) and tas < today:
+                            truck_actual_ship = add_business_days(today, 3)
+                    except Exception:
+                        pass
             for _, a in subset.iterrows():
                 so = str(a.get("so"))
                 line = str(a.get("line"))
                 cust = str(a.get("customerName"))
                 src = index_map.get((so, line), {})
-
-                if has_planned_col:
-                    actual_ship = src.get(plannedDeliveryCol)  # type: ignore[index]
-                else:
-                    actual_ship = next_business_day()
                 ship_date = src.get(col_latest_due) if col_latest_due in src else src.get("Latest Due")
-                # Convert pandas/py datetime to timezone-naive python dt for Excel
-                def as_dt(v: Any) -> Any:
-                    if isinstance(v, pd.Timestamp):
-                        try:
-                            # drop timezone if present
-                            if v.tz is not None or getattr(v, 'tzinfo', None) is not None:
-                                v = v.tz_localize(None)
-                        except Exception:
-                            try:
-                                v = v.tz_convert(None)
-                            except Exception:
-                                pass
-                        return v.to_pydatetime()
-                    if isinstance(v, _dt.datetime):
-                        if v.tzinfo is not None:
-                            # make naive
-                            return v.replace(tzinfo=None)
-                        return v
-                    return v
-
+                # as_dt defined above
+                # Use on-transport values for counts and weights (no SO line quantities)
+                bpcs_val = int(a.get("piecesOnTransport") or 0)
+                bal_weight_val = float(a.get("totalWeight") or 0.0)
+                # Frm: pull from source as-is (case-insensitive), do not force numeric
+                frm_val = src.get(col_frm) if col_frm else None
+                grd_val = src.get(col_grd) if col_grd else None  # keep as-is (text in data rows)
+                size_val = src.get(col_size) if col_size else None
+                width_val = to_float(src.get(col_width)) if (col_width and col_width in src) else to_float(a.get("width"))
+                lgth_val = to_float(src.get(col_lgth)) if col_lgth else None
+                d_val = src.get(col_trttav) if col_trttav else None
+                # R#: from source 'R' column, if present
+                rnum_val = None
+                if col_r and col_r in src:
+                    rnum_val = to_int(src.get(col_r))
+                # PRV: 1 for data lines with weight
+                prv_val = 1 if float(a.get("totalWeight") or 0.0) > 0.0 else None
                 row = [
-                    as_dt(actual_ship),
+                    truck_actual_ship,
                     int(truck_num),
                     "Jordan Carriers",
                     "",
@@ -616,140 +721,177 @@ async def export_dh_load_list(
                     src.get(col_type) if col_type else None,
                     so,
                     line,
-                    route_index.get(cust, 1),
+                    rnum_val,
                     src.get(whse_col) if whse_col else None,
                     zones_by_truck.get(int(truck_num)),
                     routes_by_truck.get(int(truck_num)),
-                    src.get(col_bpcs) if col_bpcs else None,
+                    bpcs_val,
                     int(a.get("piecesOnTransport") or 0),
-                    src.get(col_bal_weight) if col_bal_weight else None,
+                    bal_weight_val,
                     float(a.get("totalWeight") or 0.0),
-                    src.get(col_frm) if col_frm else None,
-                    src.get(col_grd) if col_grd else None,
-                    src.get(col_size) if col_size else None,
-                    src.get(col_width) if col_width in src else a.get("width"),
-                    src.get(col_lgth) if col_lgth else None,
-                    src.get(col_trttav) if col_trttav else None,
+                    frm_val,
+                    grd_val,
+                    size_val,
+                    width_val,
+                    lgth_val,
+                    d_val,
+                    prv_val,
                 ]
-                rows.append(row)
-
-            # Separator/info row (light blue, italic): per-load stats
-            # Compute per-truck stats from assignments as source of truth
+                rows_local.append(row)
+            # Info row
             total_ready_weight = float(subset["totalWeight"].sum()) if "totalWeight" in subset.columns else float(trucks_meta.get(int(truck_num), {}).get("totalWeight", 0.0))
             meta = trucks_meta.get(int(truck_num), {})
             max_weight = float(meta.get("maxWeight", 0.0))
             contains_late = bool(meta.get("containsLate", False)) or (bool(subset["isLate"].any()) if "isLate" in subset.columns else False)
             max_width = float(meta.get("maxWidth", 0.0))
-            if "width" in subset.columns:
+            if "width" in subset.columns and not subset.empty:
                 try:
-                    max_width = max(float(x) for x in subset["width"].tolist() if pd.notna(x)) if not subset.empty else max_width
+                    max_width = max(float(x) for x in subset["width"].tolist() if pd.notna(x))
                 except Exception:
                     pass
-
             pct_util = (total_ready_weight / max_weight * 100.0) if max_weight > 0 else 0.0
             late_status = "Late" if contains_late else "On time"
             overwidth_status = "Overwidth" if max_width > 96 else "Not Overwidth"
-
-            # Start with all Nones, then fill specific columns
             sep_row = cast(List[Any], [None] * len(headers))
-            try:
-                rpcsi = headers.index("RPCS")
-                sep_row[rpcsi] = late_status
-            except ValueError:
-                pass
-            try:
-                rwi = headers.index("Ready Weight")
-                sep_row[rwi] = round(total_ready_weight, 2)
-            except ValueError:
-                pass
-            try:
-                frmi = headers.index("Frm")
-                sep_row[frmi] = int(max_weight) if max_weight else None
-            except ValueError:
-                pass
-            try:
-                grdi = headers.index("Grd")
-                sep_row[grdi] = f"{pct_util:.1f}%"
-            except ValueError:
-                pass
-            try:
-                widthi = headers.index("Width")
-                sep_row[widthi] = overwidth_status
-            except ValueError:
-                pass
+            for label, value in (("RPCS", late_status), ("Ready Weight", round(total_ready_weight, 2)), ("Frm", int(max_weight) if max_weight else None), ("Grd", f"{pct_util:.1f}%"), ("Width", overwidth_status)):
+                try:
+                    idx_col = headers.index(label)
+                    sep_row[idx_col] = value
+                except ValueError:
+                    pass
+            rows_local.append(sep_row)
+            sep_indices.append(len(rows_local) - 1)
+            sep_utils.append(float(pct_util))
+        return rows_local, sep_indices, sep_utils
 
-            rows.append(sep_row)
-            separator_row_indices.append(len(rows) - 1)  # 0-based index into rows
-
-    # drop trailing blank
-    if rows and (all(v is None for v in rows[-1]) or (len(separator_row_indices) and separator_row_indices[-1] == len(rows) - 1 and all(v is None for v in rows[-1]))):
-        # If the last row is an all-None separator (shouldn't occur now), drop it and adjust indices
-        rows.pop()
-        if separator_row_indices and separator_row_indices[-1] >= len(rows):
-            separator_row_indices.pop()
-
-    # Write workbook with styling
+    # Determine sort order by percent utilization (descending)
+    util_by_truck: Dict[int, float] = {}
+    if not assigns_df.empty:
+        for tnum in assigns_df["truckNumber"].unique().tolist():
+            try:
+                tnum_i = int(tnum)
+            except Exception:
+                continue
+            subset_tmp = assigns_df[assigns_df["truckNumber"] == tnum_i]
+            total_ready_weight_tmp = float(subset_tmp["totalWeight"].sum()) if "totalWeight" in subset_tmp.columns else float(trucks_meta.get(int(tnum_i), {}).get("totalWeight", 0.0))
+            max_weight_tmp = float(trucks_meta.get(int(tnum_i), {}).get("maxWeight", 0.0))
+            util_by_truck[tnum_i] = (total_ready_weight_tmp / max_weight_tmp) if max_weight_tmp > 0 else 0.0
+    sorted_trucks = sorted(util_by_truck.keys(), key=lambda k: util_by_truck.get(k, 0.0), reverse=True)
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        out_df = pd.DataFrame(rows, columns=headers)
-        sheet = "DH Load List"
-        out_df.to_excel(writer, sheet_name=sheet, index=False)
+        # Define sheets and included buckets
+        sheets_spec = [
+            ("Late + NearDue", {"Late", "NearDue"}),
+            ("WithinWindow", {"WithinWindow"}),
+        ]
+        for sheet, include in sheets_spec:
+            truck_order = [tn for tn in sorted_trucks if bucket_by_truck.get(int(tn), "WithinWindow") in include]
+            rows_local, sep_indices, sep_utils = build_rows_for(truck_order)
+            out_df = pd.DataFrame(rows_local, columns=headers)
+            out_df.to_excel(writer, sheet_name=sheet, index=False)
 
-        ws = writer.sheets[sheet]
-        # Insert hidden blank column C
-        ws.insert_cols(3)
-        ws.cell(row=1, column=3).value = None
-        ws.column_dimensions[get_column_letter(3)].hidden = True
-        # Freeze the header row
-        ws.freeze_panes = "A2"
+            ws = writer.sheets[sheet]
+            # Insert hidden blank column C
+            ws.insert_cols(3)
+            ws.cell(row=1, column=3).value = None
+            ws.column_dimensions[get_column_letter(3)].hidden = True
+            # Freeze the header row
+            ws.freeze_panes = "A2"
 
-        # Bold header
-        for c in range(1, ws.max_column + 1):
-            ws.cell(row=1, column=c).font = Font(bold=True)
+            # Bold header
+            for c in range(1, ws.max_column + 1):
+                ws.cell(row=1, column=c).font = Font(name="Calibri", size=11, bold=True)
 
-        # Shade and italicize only the separator/info rows in light blue
-        fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
-        for idx in separator_row_indices:
-            excel_row = 2 + idx  # header is row 1
-            if excel_row <= ws.max_row:
-                for c in range(1, ws.max_column + 1):
-                    cell = ws.cell(row=excel_row, column=c)
-                    cell.fill = fill
-                    cell.font = Font(italic=True)
+            # Shade and italicize only the separator/info rows in light blue
+            fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+            for idx in sep_indices:
+                excel_row = 2 + idx  # header is row 1
+                if excel_row <= ws.max_row:
+                    for c in range(1, ws.max_column + 1):
+                        cell = ws.cell(row=excel_row, column=c)
+                        cell.fill = fill
+                        cell.font = Font(name="Calibri", size=11, italic=True)
 
-        # Apply date format mm/dd/yyy to Actual Ship and Ship Date columns
-        header_to_col: Dict[str, int] = {}
-        for c in range(1, ws.max_column + 1):
-            header_val = ws.cell(row=1, column=c).value
-            if isinstance(header_val, str):
-                header_to_col[header_val.strip()] = c
-        date_fmt = "mm/dd/yyy"
-        for header in ("Actual Ship", "Ship Date"):
-            cidx = header_to_col.get(header)
-            if cidx:
+            # Apply date format mm/dd/yyy to Actual Ship and Ship Date columns
+            header_to_col: Dict[str, int] = {}
+            for c in range(1, ws.max_column + 1):
+                header_val = ws.cell(row=1, column=c).value
+                if isinstance(header_val, str):
+                    header_to_col[header_val.strip()] = c
+            date_fmt = "mm/dd/yyy"
+            for header in ("Actual Ship", "Ship Date"):
+                cidx = header_to_col.get(header)
+                if cidx:
+                    for r in range(2, ws.max_row + 1):
+                        cell = ws.cell(row=r, column=cidx)
+                        cell.number_format = date_fmt
+
+            # Color-code utilization % in separator rows (Grd column)
+            grd_col = header_to_col.get("Grd")
+            if grd_col and sep_indices:
+                for idx, util in zip(sep_indices, sep_utils):
+                    excel_row = 2 + idx
+                    if excel_row <= ws.max_row:
+                        cell = ws.cell(row=excel_row, column=grd_col)
+                        # Keep italic; set color based on thresholds
+                        if util >= 90.0:
+                            color = "FF00B050"  # green
+                        elif util >= 84.0:
+                            color = "FFFFC000"  # yellow
+                        else:
+                            color = "FFFF0000"  # red
+                        cell.font = Font(name="Calibri", size=11, italic=True, color=color)
+
+            # Apply numeric formats to non-date numeric columns
+            int_cols = ["TR#", "R#", "BPCS", "RPCS", "PRV"]  # Do not force numeric on Frm; it may be text in source
+            float_cols = ["Bal Weight", "Ready Weight", "Width", "Lgth"]
+            # Treat RPCS specially: only format as number if the cell is numeric (for data rows, RPCS is not used; sep rows contain text)
+            for hdr in int_cols:
+                cidx = header_to_col.get(hdr)
+                if not cidx:
+                    continue
                 for r in range(2, ws.max_row + 1):
                     cell = ws.cell(row=r, column=cidx)
-                    # Set number format regardless; Excel will apply to date values
-                    cell.number_format = date_fmt
-
-        # Auto-fit column widths (skip hidden column C)
-        for c in range(1, ws.max_column + 1):
-            if ws.column_dimensions[get_column_letter(c)].hidden:
-                continue
-            max_len = 0
-            for r in range(1, ws.max_row + 1):
-                val = ws.cell(row=r, column=c).value
-                if val is None:
+                    if hdr == "RPCS" and isinstance(cell.value, str):
+                        continue
+                    cell.number_format = "0"
+            for hdr in float_cols:
+                cidx = header_to_col.get(hdr)
+                if not cidx:
                     continue
-                sval = val if isinstance(val, str) else str(val)
-                if len(sval) > max_len:
-                    max_len = len(sval)
-            # Add padding, clamp to a reasonable max
-            width = min(max_len + 2, 50)
-            # Ensure a sensible minimum width for key columns
-            if width < 10:
-                width = 10
-            ws.column_dimensions[get_column_letter(c)].width = width
+                for r in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=r, column=cidx)
+                    cell.number_format = "#,##0.00"
+
+            # Standardize font to Calibri 11 for entire sheet while preserving bold/italic/colors
+            for r in range(1, ws.max_row + 1):
+                for c in range(1, ws.max_column + 1):
+                    cell = ws.cell(row=r, column=c)
+                    f = cell.font or Font()
+                    cell.font = Font(name="Calibri", size=11, bold=f.bold, italic=f.italic, color=f.color)
+
+            # Left-align all cells
+            left_align = Alignment(horizontal="left")
+            for r in range(1, ws.max_row + 1):
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(row=r, column=c).alignment = left_align
+
+            # Auto-fit column widths (skip hidden column C)
+            for c in range(1, ws.max_column + 1):
+                if ws.column_dimensions[get_column_letter(c)].hidden:
+                    continue
+                max_len = 0
+                for r in range(1, ws.max_row + 1):
+                    val = ws.cell(row=r, column=c).value
+                    if val is None:
+                        continue
+                    sval = val if isinstance(val, str) else str(val)
+                    if len(sval) > max_len:
+                        max_len = len(sval)
+                width = min(max_len + 2, 50)
+                if width < 10:
+                    width = 10
+                ws.column_dimensions[get_column_letter(c)].width = width
 
     output.seek(0)
     return StreamingResponse(
