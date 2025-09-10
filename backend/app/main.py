@@ -20,6 +20,10 @@ from .schemas import (
 )
 from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
+from dotenv import load_dotenv  # new
+import os
+import psycopg
+from urllib.parse import quote_plus, urlparse, urlunparse, parse_qsl, urlencode
 
 
 REQUIRED_COLUMNS_MAPPED: List[str] = [
@@ -49,10 +53,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+load_dotenv()  # new: loads backend/.env
+
+
+def _ensure_sslmode(dsn: str) -> str:
+    """Append sslmode=require if not present in DSN query string.
+
+    Handles both DSN with and without existing query params.
+    """
+    try:
+        parsed = urlparse(dsn)
+        # If not a URL (e.g., key=value DSN), just return as-is
+        if not parsed.scheme or not parsed.netloc:
+            return dsn
+        q = dict(parse_qsl(parsed.query))
+        if "sslmode" not in q:
+            q["sslmode"] = "require"
+            new_query = urlencode(q)
+            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+        return dsn
+    except Exception:
+        return dsn
+
+
+def _build_supabase_dsn() -> str:
+    """Build a Postgres DSN.
+
+    Priority:
+    1) SUPABASE_DB_URL (if provided)
+    2) Construct from SUPABASE_DB_HOST, SUPABASE_DB_PORT, SUPABASE_DB_NAME, SUPABASE_DB_USER, SUPABASE_DB_PASSWORD
+       (password is URL-encoded to handle special characters)
+    Always ensures sslmode=require for Supabase.
+    """
+    # 1) Direct URL
+    raw = os.getenv("SUPABASE_DB_URL")
+    if raw:
+        return _ensure_sslmode(raw)
+
+    # 2) Assemble from parts
+    host = os.getenv("SUPABASE_DB_HOST")
+    user = os.getenv("SUPABASE_DB_USER", "postgres")
+    password = os.getenv("SUPABASE_DB_PASSWORD")
+    dbname = os.getenv("SUPABASE_DB_NAME", "postgres")
+    port = os.getenv("SUPABASE_DB_PORT", "5432")
+    if host and password:
+        pw_enc = quote_plus(password)
+        dsn = f"postgresql://{user}:{pw_enc}@{host}:{port}/{dbname}?sslmode=require"
+        return dsn
+    return ""
+
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/db/ping")
+def db_ping() -> Dict[str, Any]:
+    """Test connection to Supabase Postgres using SUPABASE_DB_URL.
+
+    Returns a tiny payload with server_version and current_timestamp from the DB.
+    """
+    dsn = _build_supabase_dsn()
+    if not dsn:
+        raise HTTPException(status_code=500, detail="Database connection not configured. Set SUPABASE_DB_URL or SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD.")
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select version(), now();")
+                version, now_val = cur.fetchone()
+        return {"ok": True, "version": str(version), "now": str(now_val)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB ping failed: {exc}") from exc
 
 
 @app.post("/upload/preview", response_model=UploadPreviewResponse)
@@ -149,6 +221,21 @@ async def optimize(
 
     trucks_list = trucks_df.to_dict(orient="records") if not trucks_df.empty else []
     assigns_list = assigns_df.to_dict(orient="records") if not assigns_df.empty else []
+    
+    # Clean up NaN values in assignments before creating Pydantic models
+    for assign in assigns_list:
+        # Handle NaN values for boolean fields
+        if pd.isna(assign.get('isRemainder')):
+            assign['isRemainder'] = False
+        if pd.isna(assign.get('isPartial')):
+            assign['isPartial'] = False
+        # Handle NaN values for string fields
+        if pd.isna(assign.get('parentLine')):
+            assign['parentLine'] = None
+        # Handle NaN values for integer fields
+        if pd.isna(assign.get('remainingPieces')):
+            assign['remainingPieces'] = 0
+    
     # Ensure JSON-serializable keys and create typed models
     trucks_models: List[TruckSummary] = [TruckSummary(**{str(k): v for k, v in t.items()}) for t in trucks_list]
     assigns_models: List[LineAssignment] = [LineAssignment(**{str(k): v for k, v in a.items()}) for a in assigns_list]
@@ -581,7 +668,7 @@ async def export_dh_load_list(
             routes_by_truck[tnum] = None if pd.isna(trow.get("route")) else str(trow.get("route"))
 
     headers = [
-        "Actual Ship", "TR#", "Carrier", "Loaded", "Shipped", "Ship Date", "Customer", "Type",
+        "Actual Ship", "TR#", "Carrier", "Loaded", "Shipped", "Earliest Ship Date", "Ship Date", "Customer", "Type",
         "SO#", "SO Line", "R#", "WHSE", "Zone", "Route", "BPCS", "RPCS", "Bal Weight",
         "Ready Weight", "Frm", "Grd", "Size", "Width", "Lgth", "D", "PRV",
     ]
@@ -666,7 +753,11 @@ async def export_dh_load_list(
                     for _, arow in subset.iterrows():
                         so = str(arow.get("so"))
                         line = str(arow.get("line"))
-                        src = index_map.get((so, line), {})
+                        # Strip remainder suffixes for index_map lookup since source data doesn't have them
+                        line_for_lookup = line
+                        if line and line.endswith(('-R1', '-R2', '-R3', '-R4', '-R5', '-R6', '-R7', '-R8', '-R9')):
+                            line_for_lookup = line[:-3]  # Remove the -RX suffix
+                        src = index_map.get((so, line_for_lookup), {})
                         ed_vals.append(src.get(col_earliest_due_src))
                     try:
                         ed_series = pd.to_datetime(pd.Series(ed_vals), errors="coerce")
@@ -690,8 +781,14 @@ async def export_dh_load_list(
             for _, a in subset.iterrows():
                 so = str(a.get("so"))
                 line = str(a.get("line"))
+                # Strip remainder suffixes (-R1, -R2, etc.) from line number for DH load list export
+                line_for_export = line
+                line_for_lookup = line
+                if line and line.endswith(('-R1', '-R2', '-R3', '-R4', '-R5', '-R6', '-R7', '-R8', '-R9')):
+                    line_for_export = line[:-3]  # Remove the -RX suffix for export
+                    line_for_lookup = line[:-3]  # Remove the -RX suffix for index_map lookup
                 cust = str(a.get("customerName"))
-                src = index_map.get((so, line), {})
+                src = index_map.get((so, line_for_lookup), {})
                 ship_date = src.get(col_latest_due) if col_latest_due in src else src.get("Latest Due")
                 # as_dt defined above
                 # Use on-transport values for counts and weights (no SO line quantities)
@@ -710,17 +807,21 @@ async def export_dh_load_list(
                     rnum_val = to_int(src.get(col_r))
                 # PRV: 1 for data lines with weight
                 prv_val = 1 if float(a.get("totalWeight") or 0.0) > 0.0 else None
+                # Get earliest ship date from source data
+                earliest_ship_date = src.get(col_earliest_due_src) if col_earliest_due_src in src else src.get("Earliest Due")
+                
                 row = [
                     truck_actual_ship,
                     int(truck_num),
                     "Jordan Carriers",
                     "",
                     "",
+                    as_dt(earliest_ship_date),
                     as_dt(ship_date),
                     cust,
                     src.get(col_type) if col_type else None,
                     so,
-                    line,
+                    line_for_export,  # Use cleaned line number without remainder suffix
                     rnum_val,
                     src.get(whse_col) if whse_col else None,
                     zones_by_truck.get(int(truck_num)),
@@ -812,14 +913,14 @@ async def export_dh_load_list(
                         cell.fill = fill
                         cell.font = Font(name="Calibri", size=11, italic=True)
 
-            # Apply date format mm/dd/yyy to Actual Ship and Ship Date columns
+            # Apply date format mm/dd/yyy to Actual Ship, Ship Date, and Earliest Ship Date columns
             header_to_col: Dict[str, int] = {}
             for c in range(1, ws.max_column + 1):
                 header_val = ws.cell(row=1, column=c).value
                 if isinstance(header_val, str):
                     header_to_col[header_val.strip()] = c
             date_fmt = "mm/dd/yyy"
-            for header in ("Actual Ship", "Ship Date"):
+            for header in ("Actual Ship", "Ship Date", "Earliest Ship Date"):
                 cidx = header_to_col.get(header)
                 if cidx:
                     for r in range(2, ws.max_row + 1):

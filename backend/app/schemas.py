@@ -78,6 +78,11 @@ class LineAssignment(BaseModel):
     isLate: bool
     earliestDue: Optional[str] = None
     latestDue: Optional[str] = None
+    # New fields for remainder tracking
+    isPartial: Optional[bool] = False
+    remainingPieces: Optional[int] = 0
+    isRemainder: Optional[bool] = False
+    parentLine: Optional[str] = None
 
 
 class OptimizeResponse(BaseModel):

@@ -148,9 +148,11 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
         contains_late = False
         has_near_due = False
         pending_assignments = []
+        # Track the earliest "Earliest Due" seen on the current truck to gate mixing with Late
+        truck_earliest_due = None
 
         def finalize_truck():
-            nonlocal truck_counter, current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, has_near_due, pending_assignments
+            nonlocal truck_counter, current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, has_near_due, pending_assignments, truck_earliest_due
             if current_weight == 0:
                 return
             truck_counter += 1
@@ -199,6 +201,13 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             contains_late = False
             has_near_due = False
             pending_assignments = []
+            truck_earliest_due = None
+
+        # Track remainders that need to be processed
+        pending_remainders = []
+
+        # Normalize today's date (UTC midnight) once (per group)
+        today_utc = pd.Timestamp.now(tz="UTC").normalize()
 
         for _, row in group.iterrows():
             pieces = int(row.get("RPcs") or 0)
@@ -213,6 +222,30 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             row_bucket = str(row.get("priorityBucket", "WithinWindow"))
             if row_bucket == "NearDue":
                 has_near_due = True
+
+            # Parse earliest due for mixing rules
+            row_earliest_due = None
+            try:
+                _ed = row.get("Earliest Due")
+                if pd.notna(_ed):
+                    row_earliest_due = pd.to_datetime(_ed, errors="coerce", utc=True)
+            except Exception:
+                row_earliest_due = None
+
+            # --- Late mixing rule during INITIAL packing ---
+            # Requirement: Late orders can only be combined with orders already within the shipping window
+            # (today >= Earliest Due). Enforce both directions before placing weight:
+            # 1) If current truck already contains any Late and incoming row is NOT Late,
+            #    only allow if row_earliest_due <= today. Otherwise, finalize and start new truck.
+            if (not line_is_late) and contains_late and current_weight > 0:
+                if (row_earliest_due is None) or (pd.notna(row_earliest_due) and row_earliest_due > today_utc):
+                    finalize_truck()
+
+            # 2) If incoming row IS Late and current truck has non-late items whose earliest ship date is in future
+            #    (truck_earliest_due > today), then finalize first before placing the Late row.
+            if line_is_late and current_weight > 0 and not contains_late:
+                if (truck_earliest_due is not None) and pd.notna(truck_earliest_due) and truck_earliest_due > today_utc:
+                    finalize_truck()
 
             # If the full line won't fit, split by pieces
             needed_weight = line_total_weight
@@ -242,6 +275,11 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             max_width = max(max_width, width)
             contains_late = contains_late or line_is_late
 
+            # Update truck's earliest Earliest Due (for future mixing decisions)
+            if row_earliest_due is not None and pd.notna(row_earliest_due):
+                if (truck_earliest_due is None) or (row_earliest_due < truck_earliest_due):
+                    truck_earliest_due = row_earliest_due
+
             # Safely serialize due dates
             _earliest = row.get("Earliest Due")
             _latest = row.get("Latest Due")
@@ -267,11 +305,152 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                 "priorityBucket": str(row_bucket),
                 "earliestDue": earliest_serial,
                 "latestDue": latest_serial,
+                "isPartial": bool(take_pieces < pieces),
+                "remainingPieces": int(pieces - take_pieces) if take_pieces < pieces else 0,
+                "isRemainder": False,
+                "parentLine": None,
             })
+
+            # **CRITICAL: Track remainder if line was split**
+            remainder_pieces = pieces - take_pieces
+            if remainder_pieces > 0:
+                remainder_weight = remainder_pieces * weight_per_piece
+                # Create remainder row for processing
+                remainder_row = row.copy()
+                remainder_row["RPcs"] = remainder_pieces
+                remainder_row["Ready Weight"] = remainder_weight
+                # Mark as remainder for tracking
+                remainder_row["_is_remainder"] = True
+                remainder_row["_parent_line"] = f"{row.get('SO')}-{row.get('Line')}"
+                pending_remainders.append(remainder_row)
 
             # If we hit/exceed the max, finalize
             if current_weight >= max_weight * 0.98:  # small buffer
                 finalize_truck()
+
+        # **PROCESS ALL REMAINDERS** - Critical step that was missing!
+        # Process remainders iteratively to avoid infinite recursion
+        max_remainder_iterations = 100  # Safety limit
+        iteration_count = 0
+
+        while pending_remainders and iteration_count < max_remainder_iterations:
+            iteration_count += 1
+            current_remainders = pending_remainders.copy()
+            pending_remainders = []  # Clear for next iteration
+            
+            # Sort remainders by priority (Late first) to ensure they get allocated
+            remainder_df = pd.DataFrame(current_remainders)
+            if "priorityBucket" in remainder_df.columns:
+                priority_order = {"Late": 0, "NearDue": 1, "WithinWindow": 2, "NotDue": 3}
+                remainder_df["priorityRank"] = remainder_df["priorityBucket"].map(priority_order).fillna(2)
+                remainder_df = remainder_df.sort_values("priorityRank").reset_index(drop=True)
+            
+            # Process remainders
+            for _, remainder_row in remainder_df.iterrows():
+                pieces = int(remainder_row.get("RPcs") or 0)
+                if pieces <= 0:
+                    continue
+
+                width = float(remainder_row.get("Width") or 0.0)
+                weight_per_piece = float(remainder_row.get("Weight Per Piece") or 0.0)
+                line_total_weight = float(remainder_row.get("Ready Weight") or 0.0)
+                line_is_overwidth = bool(width > 96)
+                line_is_late = bool(remainder_row.get("Is Late", False))
+                row_bucket = str(remainder_row.get("priorityBucket", "WithinWindow"))
+                if row_bucket == "NearDue":
+                    has_near_due = True
+
+                # Parse earliest due for mixing rules
+                rem_earliest_due = None
+                try:
+                    _ed = remainder_row.get("Earliest Due")
+                    if pd.notna(_ed):
+                        rem_earliest_due = pd.to_datetime(_ed, errors="coerce", utc=True)
+                except Exception:
+                    rem_earliest_due = None
+
+                # Apply the same Late mixing rules during remainder placement
+                if (not line_is_late) and contains_late and current_weight > 0:
+                    if (rem_earliest_due is None) or (pd.notna(rem_earliest_due) and rem_earliest_due > today_utc):
+                        finalize_truck()
+                        # After finalizing, we're starting a new truck context
+                if line_is_late and current_weight > 0 and not contains_late:
+                    if (truck_earliest_due is not None) and pd.notna(truck_earliest_due) and truck_earliest_due > today_utc:
+                        finalize_truck()
+
+                # Check if remainder fits in current truck
+                needed_weight = line_total_weight
+                available_capacity = max_weight - current_weight
+                if needed_weight <= available_capacity:
+                    take_pieces = pieces
+                else:
+                    # Start new truck for remainder if current truck has items
+                    if current_weight > 0:
+                        finalize_truck()
+                        available_capacity = max_weight - current_weight
+                    take_pieces = min(pieces, int(available_capacity // weight_per_piece)) if weight_per_piece > 0 else pieces
+
+                take_pieces = max(0, min(pieces, take_pieces))
+                if take_pieces == 0:
+                    continue
+
+                taken_weight = take_pieces * weight_per_piece
+                current_weight += taken_weight
+                current_pieces += take_pieces
+                current_lines += 1
+                current_orders.add(str(remainder_row.get("SO")))
+                max_width = max(max_width, width)
+                contains_late = contains_late or line_is_late
+
+                # Safely serialize due dates
+                _earliest = remainder_row.get("Earliest Due")
+                _latest = remainder_row.get("Latest Due")
+                earliest_serial = _earliest.isoformat() if isinstance(_earliest, pd.Timestamp) and pd.notna(_earliest) else None
+                latest_serial = _latest.isoformat() if isinstance(_latest, pd.Timestamp) and pd.notna(_latest) else None
+
+                pending_assignments.append({
+                    "so": str(remainder_row.get("SO")),
+                    "line": f"{remainder_row.get('Line')}-R{iteration_count}",  # Mark as remainder with iteration
+                    "customerName": str(remainder_row.get("Customer")),
+                    "customerAddress": remainder_row.get("shipping_address_1"),
+                    "customerCity": str(remainder_row.get("shipping_city")),
+                    "customerState": str(remainder_row.get("shipping_state")),
+                    "zone": None if pd.isna(zone_val) else str(zone_val),
+                    "route": None if pd.isna(route_val) else str(route_val),
+                    "piecesOnTransport": int(take_pieces),
+                    "totalReadyPieces": int(pieces),
+                    "weightPerPiece": float(weight_per_piece),
+                    "totalWeight": float(taken_weight),
+                    "width": float(width),
+                    "isOverwidth": bool(line_is_overwidth),
+                    "isLate": bool(line_is_late),
+                    "priorityBucket": str(row_bucket),
+                    "earliestDue": earliest_serial,
+                    "latestDue": latest_serial,
+                    "isPartial": bool(take_pieces < pieces),
+                    "remainingPieces": int(pieces - take_pieces) if take_pieces < pieces else 0,
+                    "isRemainder": True,
+                    "parentLine": remainder_row.get("_parent_line", ""),
+                })
+
+                # Update truck's earliest Earliest Due (for future mixing decisions)
+                if rem_earliest_due is not None and pd.notna(rem_earliest_due):
+                    if (truck_earliest_due is None) or (rem_earliest_due < truck_earliest_due):
+                        truck_earliest_due = rem_earliest_due
+
+                # **Handle remaining pieces for next iteration**
+                remainder_pieces = pieces - take_pieces
+                if remainder_pieces > 0:
+                    remainder_weight = remainder_pieces * weight_per_piece
+                    # Create another remainder for next iteration
+                    next_remainder = remainder_row.copy()
+                    next_remainder["RPcs"] = remainder_pieces
+                    next_remainder["Ready Weight"] = remainder_weight
+                    pending_remainders.append(next_remainder)
+
+                # If we hit/exceed the max, finalize
+                if current_weight >= max_weight * 0.98:  # small buffer
+                    finalize_truck()
 
         # finalize remaining for this group
         finalize_truck()
@@ -459,6 +638,24 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                             w = float(arow.get("totalWeight") or 0.0)
                             if w <= 0:
                                 continue
+                            
+                            # If target is a Late truck, do not move assignments whose earliestDue is after today.
+                            # (Business rule: a Late truck must not contain items whose earliest ship date is later than today.)
+                            if "Late" in target_buckets:
+                                earliest_due = arow.get("earliestDue")
+                                if earliest_due is not None:
+                                    try:
+                                        # Parse the earliest due date into a Timestamp
+                                        earliest_due_date = pd.to_datetime(earliest_due, errors="coerce")
+                                        # Use today's date (normalized) as the cutoff. If earliestDue is strictly after today,
+                                        # skip moving this assignment into a Late truck.
+                                        today = pd.Timestamp.now().normalize()
+                                        if pd.notna(earliest_due_date) and earliest_due_date > today:
+                                            continue
+                                    except Exception:
+                                        # If we can't parse the date, allow the assignment to proceed (safe fallback)
+                                        pass
+                            
                             if (t_weight + w) <= (t_max * 1.0001):
                                 # Reassign
                                 assigns_df.at[ridx, "truckNumber"] = t_truck
