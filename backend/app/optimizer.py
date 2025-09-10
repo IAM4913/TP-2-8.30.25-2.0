@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Dict, Any, Tuple
 import pandas as pd
 from collections import defaultdict
+from datetime import datetime, timedelta
 from .excel_utils import build_priority_bucket
 
 # Customers that cannot be combined with other customers on same truck
@@ -38,6 +39,16 @@ def can_combine_customers(customer1: str, customer2: str) -> bool:
         return True
     # If either customer is in no-multi-stop list, they cannot be combined
     return allows_multi_stop(customer1) and allows_multi_stop(customer2)
+
+
+def is_truck_earliest_due_after_tomorrow(truck_earliest_due) -> bool:
+    """Check if truck's earliest due date is after tomorrow"""
+    if truck_earliest_due is None or pd.isna(truck_earliest_due):
+        return False
+    
+    now = pd.Timestamp.now(tz="UTC").normalize()
+    tomorrow = now + timedelta(days=1)
+    return truck_earliest_due > tomorrow
 
 
 def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -149,9 +160,10 @@ def process_customer_group(group, weight_config, truck_counter, truck_rows, assi
     contains_late = False
     bucket = None
     pending_assignments = []
+    truck_earliest_due = None
 
     def finalize_truck():
-        nonlocal current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, bucket, pending_assignments
+        nonlocal current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, bucket, pending_assignments, truck_earliest_due
         if current_weight == 0:
             return
 
@@ -185,7 +197,7 @@ def process_customer_group(group, weight_config, truck_counter, truck_rows, assi
             assignment_rows.append(a)
 
         # reset
-        nonlocal current_weight, current_pieces, current_orders, current_lines, max_width, contains_late, bucket, pending_assignments
+        nonlocal current_weight, current_pieces, current_orders, current_lines, max_width, contains_late, bucket, pending_assignments, truck_earliest_due
         current_weight = 0.0
         current_pieces = 0
         current_orders = set()
@@ -194,6 +206,7 @@ def process_customer_group(group, weight_config, truck_counter, truck_rows, assi
         contains_late = False
         bucket = None
         pending_assignments = []
+        truck_earliest_due = None
 
     for _, row in group.iterrows():
         pieces = int(row.get("RPcs") or 0)
@@ -206,6 +219,24 @@ def process_customer_group(group, weight_config, truck_counter, truck_rows, assi
         line_is_overwidth = bool(width > 96)
         line_is_late = bool(row.get("Is Late", False))
         bucket = bucket or str(row.get("priorityBucket", "WithinWindow"))
+        
+        # Get the earliest due date for this line
+        line_earliest_due = row.get("Earliest Due")
+        if pd.notna(line_earliest_due):
+            line_earliest_due = pd.to_datetime(line_earliest_due, errors="coerce")
+
+        # Apply new rule: No late order can ever be on a truck that has an earliest due date later than tomorrow
+        # Check if adding this line would violate the rule
+        if line_is_late and current_weight > 0:
+            # Calculate what the truck's earliest due would be if we add this line
+            potential_earliest_due = truck_earliest_due
+            if pd.notna(line_earliest_due):
+                if potential_earliest_due is None or line_earliest_due < potential_earliest_due:
+                    potential_earliest_due = line_earliest_due
+            
+            # If the truck (including this potential line) would have earliest due after tomorrow, finalize truck first
+            if is_truck_earliest_due_after_tomorrow(potential_earliest_due):
+                finalize_truck()
 
         # If the full line won't fit, split by pieces
         needed_weight = line_total_weight
@@ -234,6 +265,11 @@ def process_customer_group(group, weight_config, truck_counter, truck_rows, assi
         current_orders.add(str(row.get("SO")))
         max_width = max(max_width, width)
         contains_late = contains_late or line_is_late
+        
+        # Update truck's earliest due date
+        if pd.notna(line_earliest_due):
+            if truck_earliest_due is None or line_earliest_due < truck_earliest_due:
+                truck_earliest_due = line_earliest_due
 
         pending_assignments.append({
             "so": str(row.get("SO")),
@@ -284,9 +320,10 @@ def process_combinable_group(group, weight_config, truck_counter, truck_rows, as
     bucket = None
     pending_assignments = []
     current_customers = set()
+    truck_earliest_due = None
 
     def finalize_truck():
-        nonlocal current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, bucket, pending_assignments, current_customers
+        nonlocal current_weight, current_pieces, current_lines, current_orders, max_width, contains_late, bucket, pending_assignments, current_customers, truck_earliest_due
         if current_weight == 0:
             return
 
@@ -336,6 +373,7 @@ def process_combinable_group(group, weight_config, truck_counter, truck_rows, as
         bucket = None
         pending_assignments = []
         current_customers = set()
+        truck_earliest_due = None
 
     for _, row in group.iterrows():
         pieces = int(row.get("RPcs") or 0)
@@ -349,6 +387,24 @@ def process_combinable_group(group, weight_config, truck_counter, truck_rows, as
         line_is_overwidth = bool(width > 96)
         line_is_late = bool(row.get("Is Late", False))
         bucket = bucket or str(row.get("priorityBucket", "WithinWindow"))
+        
+        # Get the earliest due date for this line
+        line_earliest_due = row.get("Earliest Due")
+        if pd.notna(line_earliest_due):
+            line_earliest_due = pd.to_datetime(line_earliest_due, errors="coerce")
+
+        # Apply new rule: No late order can ever be on a truck that has an earliest due date later than tomorrow
+        # Check if adding this line would violate the rule
+        if line_is_late and current_weight > 0:
+            # Calculate what the truck's earliest due would be if we add this line
+            potential_earliest_due = truck_earliest_due
+            if pd.notna(line_earliest_due):
+                if potential_earliest_due is None or line_earliest_due < potential_earliest_due:
+                    potential_earliest_due = line_earliest_due
+            
+            # If the truck (including this potential line) would have earliest due after tomorrow, finalize truck first
+            if is_truck_earliest_due_after_tomorrow(potential_earliest_due):
+                finalize_truck()
 
         # If the full line won't fit, split by pieces
         needed_weight = line_total_weight
@@ -378,6 +434,11 @@ def process_combinable_group(group, weight_config, truck_counter, truck_rows, as
         current_customers.add(customer)  # Track multiple customers
         max_width = max(max_width, width)
         contains_late = contains_late or line_is_late
+        
+        # Update truck's earliest due date
+        if pd.notna(line_earliest_due):
+            if truck_earliest_due is None or line_earliest_due < truck_earliest_due:
+                truck_earliest_due = line_earliest_due
 
         pending_assignments.append({
             "so": str(row.get("SO")),

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Iterable
 import pandas as pd
 from datetime import datetime, timezone
+import re
 
 
 REQUIRED_COLUMNS_MAPPED: List[str] = [
@@ -64,3 +65,37 @@ def build_priority_bucket(row: pd.Series) -> str:
     if days <= 3:
         return "NearDue"
     return "WithinWindow"
+
+
+# ---- Planning Warehouse helpers ----
+def _norm_key(s: Any) -> str:
+    s = str(s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def _find_planning_whse_col(df: pd.DataFrame) -> Optional[str]:
+    """Find the Planning Warehouse column regardless of case/spacing/variants."""
+    normalized = { _norm_key(c): c for c in df.columns }
+    # Preferred direct matches
+    for target in ("planningwhse", "planningwarehouse", "planningwhs", "planningwhsecode"):
+        if target in normalized:
+            return normalized[target]
+    # Fallback: contains both planning and whse/warehouse tokens
+    for nk, orig in normalized.items():
+        if "planning" in nk and ("whse" in nk or "warehouse" in nk or "whs" in nk):
+            return orig
+    return None
+
+
+def filter_by_planning_whse(df: pd.DataFrame, allowed_values: Iterable[str] = ("ZAC",)) -> pd.DataFrame:
+    """Return only rows where Planning Whse matches one of allowed_values (case-insensitive). If column not found, return original df unmodified."""
+    col = _find_planning_whse_col(df)
+    if not col:
+        return df
+    allowed = {str(v).strip().upper() for v in allowed_values}
+    series = df[col].astype(str).str.strip().str.upper()
+    mask = series.isin(list(allowed))
+    return df.loc[mask].reset_index(drop=True)

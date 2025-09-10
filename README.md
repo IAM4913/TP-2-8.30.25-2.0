@@ -59,9 +59,9 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
 ```
 
-The API will be available at `http://localhost:8010`
-- API Documentation: `http://localhost:8010/docs`
-- Health Check: `http://localhost:8010/health`
+The API will be available at `http://127.0.0.1:8010/`
+- API Documentation: `http://127.0.0.1:8010/docs`
+- Health Check: `http://127.0.0.1:8010/health`
 
 ### Frontend Setup
 

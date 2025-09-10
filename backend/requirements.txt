@@ -7,6 +7,15 @@ orjson==3.10.7
 numpy==2.0.1
 python-dateutil==2.9.0.post0
 
+# For FastAPI file uploads
+python-multipart==0.0.9
+
+# Env loader
+python-dotenv==1.0.1
+
+# Postgres client for Supabase
+psycopg[binary]==3.2.9
+
 
 
 

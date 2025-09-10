@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Settings, Play, Loader2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Settings, Play, Loader2, Warehouse as WarehouseIcon } from 'lucide-react';
 import { optimizeRoutes } from '../api';
 import { WeightConfig, OptimizeResponse } from '../types';
 
@@ -18,13 +18,27 @@ const Dashboard: React.FC<DashboardProps> = ({
 }) => {
     const [optimizing, setOptimizing] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [planningWhse, setPlanningWhse] = useState<string>(() => {
+        if (typeof window !== 'undefined') {
+            const saved = localStorage.getItem('planningWhse');
+            if (saved && saved.trim()) return saved.toUpperCase();
+        }
+        return 'ZAC';
+    });
+
+    // Persist planningWhse so export buttons can use the same filter later
+    useEffect(() => {
+        if (typeof window !== 'undefined') {
+            localStorage.setItem('planningWhse', planningWhse);
+        }
+    }, [planningWhse]);
 
     const handleOptimize = async () => {
         setOptimizing(true);
         setError(null);
 
         try {
-            const results = await optimizeRoutes(file, { weightConfig });
+            const results = await optimizeRoutes(file, { planningWhse });
             onOptimizeComplete(results);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Optimization failed');
@@ -45,8 +59,28 @@ const Dashboard: React.FC<DashboardProps> = ({
             <div className="text-center mb-8">
                 <h2 className="text-3xl font-bold text-gray-900 mb-4">Configure Optimization</h2>
                 <p className="text-lg text-gray-600">
-                    Adjust weight limits and run optimization for <strong>{file.name}</strong>
+                    Adjust parameters and run optimization for <strong>{file.name}</strong>
                 </p>
+            </div>
+
+            <div className="bg-white rounded-lg shadow p-6 mb-8">
+                <div className="flex items-center mb-6">
+                    <WarehouseIcon className="h-5 w-5 text-gray-500 mr-2" />
+                    <h3 className="text-lg font-semibold text-gray-900">Planning Warehouse</h3>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Planning Whse</label>
+                        <input
+                            type="text"
+                            value={planningWhse}
+                            onChange={(e) => setPlanningWhse(e.target.value.toUpperCase())}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            placeholder="e.g., ZAC"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">Filters orders to this Planning Whse before optimizing. Default ZAC.</p>
+                    </div>
+                </div>
             </div>
 
             <div className="bg-white rounded-lg shadow p-6 mb-8">
