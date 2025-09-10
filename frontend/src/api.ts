@@ -1,8 +1,11 @@
 import axios from 'axios';
 import { UploadPreviewResponse, OptimizeResponse, CombineTrucksRequest, CombineTrucksResponse } from './types';
 
+// Allow overriding the API base URL in production (e.g., Vercel) via env var
+// Falls back to the dev proxy path '/api' when not provided
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
 const api = axios.create({
-    baseURL: '/api',
+    baseURL: apiBaseUrl,
 });
 
 export const uploadPreview = async (file: File): Promise<UploadPreviewResponse> => {
