@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Download, Upload, Eye, Truck, AlertTriangle, Clock, CheckCircle } from 'lucide-react';
 import { exportTrucks, exportDhLoadList } from '../api';
-import { OptimizeResponse, TruckSummary } from '../types';
+import { OptimizeResponse, TruckSummary, LineAssignment } from '../types';
 
 interface TruckResultsProps {
     results: OptimizeResponse;
@@ -17,6 +17,10 @@ const TruckResults: React.FC<TruckResultsProps> = ({
     const [selectedTruck, setSelectedTruck] = useState<number | null>(null);
     const [exporting, setExporting] = useState(false);
     const [exportingDh, setExportingDh] = useState(false);
+    const [plannedSelections, setPlannedSelections] = useState<Record<string, {
+        truckNumber: number;
+        assignment: LineAssignment;
+    }>>({});
 
     // Attempt to infer planningWhse used from localStorage (set by Dashboard), else default ZAC
     const planningWhse = (typeof window !== 'undefined' && localStorage.getItem('planningWhse')) || 'ZAC';
@@ -112,6 +116,83 @@ const TruckResults: React.FC<TruckResultsProps> = ({
         ? results.assignments.filter(a => a.truckNumber === selectedTruck)
         : [];
 
+    const plannedCount = Object.keys(plannedSelections).length;
+
+    const isPlanned = (a: LineAssignment) => {
+        const id = `${a.truckNumber}-${a.so}-${a.line}`;
+        return Boolean(plannedSelections[id]);
+    };
+
+    const togglePlanned = (a: LineAssignment) => {
+        const id = `${a.truckNumber}-${a.so}-${a.line}`;
+        setPlannedSelections(prev => {
+            const copy = { ...prev };
+            if (copy[id]) {
+                delete copy[id];
+            } else {
+                copy[id] = { truckNumber: a.truckNumber, assignment: a };
+            }
+            return copy;
+        });
+    };
+
+    const clearPlanned = () => setPlannedSelections({});
+
+    const selectTruckAll = (truckNumber: number, select: boolean) => {
+        const truckAssignments = results.assignments.filter(a => a.truckNumber === truckNumber);
+        setPlannedSelections(prev => {
+            const copy = { ...prev } as typeof prev;
+            for (const a of truckAssignments) {
+                const id = `${a.truckNumber}-${a.so}-${a.line}`;
+                if (select) {
+                    copy[id] = { truckNumber: a.truckNumber, assignment: a };
+                } else {
+                    delete copy[id];
+                }
+            }
+            return copy;
+        });
+    };
+
+    const handlePlanLoads = () => {
+        if (plannedCount === 0) return;
+        const headers = [
+            'Truck #',
+            'trttav_no',
+            'SO',
+            'Line',
+            'Pieces',
+            'Weight',
+        ];
+
+        const rows = Object.values(plannedSelections).map(({ truckNumber, assignment }) => [
+            String(truckNumber),
+            assignment.trttav_no ?? '',
+            assignment.so,
+            assignment.line,
+            String(assignment.piecesOnTransport),
+            String(assignment.totalWeight),
+        ]);
+
+        const csv = [headers, ...rows].map(r => r.map(cell => {
+            const s = String(cell ?? '');
+            if (/[",\n]/.test(s)) {
+                return '"' + s.replace(/"/g, '""') + '"';
+            }
+            return s;
+        }).join(',')).join('\n');
+
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'planned_loads.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
+
     return (
         <div className="max-w-7xl mx-auto">
             <div className="flex justify-between items-center mb-8">
@@ -128,6 +209,21 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                     >
                         <Upload className="h-4 w-4 mr-2" />
                         New Upload
+                    </button>
+                    <button
+                        onClick={clearPlanned}
+                        disabled={plannedCount === 0}
+                        className={`inline-flex items-center px-4 py-2 rounded-lg font-medium ${plannedCount === 0 ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-white text-gray-700 border hover:bg-gray-50'}`}
+                        title="Clear all planned selections"
+                    >
+                        Select none
+                    </button>
+                    <button
+                        onClick={handlePlanLoads}
+                        disabled={plannedCount === 0}
+                        className={`inline-flex items-center px-4 py-2 rounded-lg font-medium ${plannedCount === 0 ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`}
+                    >
+                        Plan Loads{plannedCount > 0 ? ` (${plannedCount})` : ''}
                     </button>
                     <button
                         onClick={handleExport}
@@ -172,6 +268,9 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                             .map((truck) => {
                                                 const utilization = calcUtilization(truck).toFixed(1);
 
+                                                const truckPlannedCount = results.assignments.filter(a => a.truckNumber === truck.truckNumber && isPlanned(a)).length;
+                                                const truckLineCount = results.assignments.filter(a => a.truckNumber === truck.truckNumber).length;
+                                                const allSelected = truckPlannedCount > 0 && truckPlannedCount === truckLineCount;
                                                 return (
                                                     <div
                                                         key={truck.truckNumber}
@@ -187,6 +286,15 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                                                 </span>
                                                             </div>
                                                             <div className="flex items-center space-x-3">
+                                                                <label className="inline-flex items-center gap-2 text-xs text-gray-700" onClick={(e) => e.stopPropagation()}>
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        className="h-4 w-4"
+                                                                        checked={allSelected}
+                                                                        onChange={(e) => selectTruckAll(truck.truckNumber, e.target.checked)}
+                                                                    />
+                                                                    <span>Plan all ({truckPlannedCount}/{truckLineCount})</span>
+                                                                </label>
                                                                 <span className={`px-2 py-1 rounded text-xs font-medium ${getUtilizationColor(truck)}`}>
                                                                     {utilization}%
                                                                 </span>
@@ -245,6 +353,15 @@ const TruckResults: React.FC<TruckResultsProps> = ({
 
                                             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between text-xs text-gray-500 gap-1">
                                                 <div className="flex items-center gap-4">
+                                                    <label className="inline-flex items-center gap-2 text-gray-700">
+                                                        <input
+                                                            type="checkbox"
+                                                            className="h-4 w-4"
+                                                            checked={isPlanned(assignment)}
+                                                            onChange={() => togglePlanned(assignment)}
+                                                        />
+                                                        <span className="text-xs">Include in Plan Loads</span>
+                                                    </label>
                                                     <span>{assignment.width}" wide</span>
                                                     {assignment.isOverwidth && (
                                                         <span className="text-orange-600 font-medium">Overwidth</span>
@@ -270,6 +387,12 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                             </div>
                                         </div>
                                     ))}
+                                    {plannedCount > 0 && (
+                                        <div className="flex items-center justify-between pt-2 text-sm">
+                                            <div className="text-gray-700">Selected for Plan Loads: <span className="font-semibold">{plannedCount}</span></div>
+                                            <button onClick={clearPlanned} className="text-gray-600 hover:text-gray-800">Clear</button>
+                                        </div>
+                                    )}
                                 </div>
                             ) : (
                                 <div className="text-center text-gray-500 py-8">

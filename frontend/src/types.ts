@@ -41,6 +41,7 @@ export interface LineAssignment {
     truckNumber: number;
     so: string;
     line: string;
+    trttav_no?: string; // Optional transport/load identifier if provided by backend
     customerName: string;
     customerAddress?: string;
     customerCity: string;
