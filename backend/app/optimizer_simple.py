@@ -83,6 +83,8 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
 
     zone_src = find_col('zone')
     route_src = find_col('route')
+    # Source transport identifier column (e.g., trttav_no)
+    trttav_src = find_col('trttavno', contains_ok=False) or find_col('trttavno')
     if zone_src is not None and 'Zone' not in df.columns:
         df['Zone'] = df[zone_src]
     if route_src is not None and 'Route' not in df.columns:
@@ -289,6 +291,8 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
             pending_assignments.append({
                 "so": str(row.get("SO")),
                 "line": str(row.get("Line")),
+                # Pass through transport/load identifier from original source, normalized
+                "trttav_no": (str(row.get(trttav_src)) if trttav_src and trttav_src in row.index else None),
                 "customerName": str(row.get("Customer")),
                 "customerAddress": row.get("shipping_address_1"),
                 "customerCity": str(row.get("shipping_city")),
@@ -411,6 +415,7 @@ def naive_grouping(df: pd.DataFrame, weight_config: Dict[str, int]) -> Tuple[pd.
                 pending_assignments.append({
                     "so": str(remainder_row.get("SO")),
                     "line": f"{remainder_row.get('Line')}-R{iteration_count}",  # Mark as remainder with iteration
+                    "trttav_no": (str(remainder_row.get(trttav_src)) if trttav_src and trttav_src in remainder_row.index else None),
                     "customerName": str(remainder_row.get("Customer")),
                     "customerAddress": remainder_row.get("shipping_address_1"),
                     "customerCity": str(remainder_row.get("shipping_city")),

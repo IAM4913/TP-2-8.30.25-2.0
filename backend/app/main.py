@@ -470,6 +470,7 @@ async def combine_trucks(
             truckNumber=tnum_int,
             so=str(a.get("so")),
             line=str(a.get("line")),
+            trttav_no=str(a.get("trttav_no")) if pd.notna(a.get("trttav_no")) else None,
             customerName=str(a.get("customerName")),
             customerAddress=a.get("customerAddress"),
             customerCity=str(a.get("customerCity")),

@@ -65,6 +65,7 @@ class LineAssignment(BaseModel):
     truckNumber: int
     so: str
     line: str
+    trttav_no: Optional[str] = None
     customerName: str
     customerAddress: Optional[str] = None
     customerCity: str
