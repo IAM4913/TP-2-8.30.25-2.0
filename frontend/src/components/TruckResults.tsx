@@ -117,6 +117,11 @@ const TruckResults: React.FC<TruckResultsProps> = ({
         : [];
 
     const plannedCount = Object.keys(plannedSelections).length;
+    const plannedTruckCount = useMemo(() => {
+        const ids = new Set<number>();
+        for (const v of Object.values(plannedSelections)) ids.add(v.truckNumber);
+        return ids.size;
+    }, [plannedSelections]);
 
     const isPlanned = (a: LineAssignment) => {
         const id = `${a.truckNumber}-${a.so}-${a.line}`;
@@ -186,7 +191,12 @@ const TruckResults: React.FC<TruckResultsProps> = ({
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'planned_loads.csv';
+        const today = new Date();
+        const y = today.getFullYear();
+        const m = String(today.getMonth() + 1).padStart(2, '0');
+        const d = String(today.getDate()).padStart(2, '0');
+        const dateStr = `${y}-${m}-${d}`;
+        a.download = `planned_loads_${dateStr}_${plannedTruckCount}trucks.csv`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -223,7 +233,7 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                         disabled={plannedCount === 0}
                         className={`inline-flex items-center px-4 py-2 rounded-lg font-medium ${plannedCount === 0 ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`}
                     >
-                        Plan Loads{plannedCount > 0 ? ` (${plannedCount})` : ''}
+                        Plan Loads{plannedCount > 0 ? ` (${plannedTruckCount} truck${plannedTruckCount === 1 ? '' : 's'})` : ''}
                     </button>
                     <button
                         onClick={handleExport}
