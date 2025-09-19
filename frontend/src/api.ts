@@ -6,6 +6,7 @@ import { UploadPreviewResponse, OptimizeResponse, CombineTrucksRequest, CombineT
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
 const api = axios.create({
     baseURL: apiBaseUrl,
+    timeout: 45000,
 });
 
 export const uploadPreview = async (file: File): Promise<UploadPreviewResponse> => {
