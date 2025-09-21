@@ -112,6 +112,26 @@ const TruckResults: React.FC<TruckResultsProps> = ({
         return 'text-red-600 bg-red-50';
     };
 
+    // Compute date ranges for a given truck
+    const getTruckDateRanges = (truckNumber: number) => {
+        const assigns = results.assignments.filter(a => a.truckNumber === truckNumber);
+        const parse = (v?: string | null) => {
+            if (!v) return null;
+            const d = new Date(v);
+            return isNaN(d.getTime()) ? null : d;
+        };
+        const earliestDates = assigns.map(a => parse(a.earliestDue)).filter((d): d is Date => d !== null);
+        const latestDates = assigns.map(a => parse(a.latestDue)).filter((d): d is Date => d !== null);
+        const minDate = (arr: Date[]) => arr.length ? new Date(Math.min(...arr.map(d => d.getTime()))) : null;
+        const maxDate = (arr: Date[]) => arr.length ? new Date(Math.max(...arr.map(d => d.getTime()))) : null;
+        return {
+            earliest_min: minDate(earliestDates),
+            earliest_max: maxDate(earliestDates),
+            latest_min: minDate(latestDates),
+            latest_max: maxDate(latestDates),
+        };
+    };
+
     const selectedTruckAssignments = selectedTruck
         ? results.assignments.filter(a => a.truckNumber === selectedTruck)
         : [];
@@ -281,6 +301,7 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                                 const truckPlannedCount = results.assignments.filter(a => a.truckNumber === truck.truckNumber && isPlanned(a)).length;
                                                 const truckLineCount = results.assignments.filter(a => a.truckNumber === truck.truckNumber).length;
                                                 const allSelected = truckPlannedCount > 0 && truckPlannedCount === truckLineCount;
+                                                const ranges = getTruckDateRanges(truck.truckNumber);
                                                 return (
                                                     <div
                                                         key={truck.truckNumber}
@@ -317,10 +338,18 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                                             </div>
                                                         </div>
 
-                                                        <div className="mt-2 text-xs text-gray-500 grid grid-cols-3 gap-4">
+                                                        <div className="mt-2 text-xs text-gray-500 grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-4">
                                                             <span>{truck.totalOrders} orders</span>
                                                             <span>{truck.totalLines} lines</span>
                                                             <span>{truck.totalPieces.toLocaleString()} pieces</span>
+                                                            <span className="whitespace-nowrap">
+                                                                Earliest: {ranges.earliest_min ? ranges.earliest_min.toLocaleDateString() : '-'}
+                                                                {ranges.earliest_max ? ` → ${ranges.earliest_max.toLocaleDateString()}` : ''}
+                                                            </span>
+                                                            <span className="whitespace-nowrap">
+                                                                Latest: {ranges.latest_min ? ranges.latest_min.toLocaleDateString() : '-'}
+                                                                {ranges.latest_max ? ` → ${ranges.latest_max.toLocaleDateString()}` : ''}
+                                                            </span>
                                                         </div>
                                                     </div>
                                                 );
