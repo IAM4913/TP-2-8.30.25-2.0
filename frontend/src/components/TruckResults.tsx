@@ -338,10 +338,12 @@ const TruckResults: React.FC<TruckResultsProps> = ({
                                                             </div>
                                                         </div>
 
-                                                        <div className="mt-2 text-xs text-gray-500 grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+                                                        <div className="mt-2 text-xs text-gray-500 grid grid-cols-1 sm:grid-cols-3 gap-4">
                                                             <span>{truck.totalOrders} orders</span>
                                                             <span>{truck.totalLines} lines</span>
                                                             <span>{truck.totalPieces.toLocaleString()} pieces</span>
+                                                        </div>
+                                                        <div className="mt-1 text-xs text-gray-500 grid grid-cols-1 sm:grid-cols-2 gap-4">
                                                             <span className="whitespace-nowrap">
                                                                 Earliest: {ranges.earliest_min ? ranges.earliest_min.toLocaleDateString() : '-'}
                                                                 {ranges.earliest_max ? ` → ${ranges.earliest_max.toLocaleDateString()}` : ''}
