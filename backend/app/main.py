@@ -18,12 +18,19 @@ from .schemas import (
     CombineTrucksRequest,
     CombineTrucksResponse,
 )
-from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse
+from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse, extract_unique_addresses
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
 from dotenv import load_dotenv  # new
 import os
 import psycopg
 from urllib.parse import quote_plus, urlparse, urlunparse, parse_qsl, urlencode
+from .geocode_service import (
+    google_geocode_query,
+    cache_lookup_address,
+    cache_upsert_address,
+    build_address_query,
+)
+from .distance_service import google_distance_matrix, haversine_matrix
 
 
 REQUIRED_COLUMNS_MAPPED: List[str] = [
@@ -101,6 +108,98 @@ def _build_supabase_dsn() -> str:
         dsn = f"postgresql://{user}:{pw_enc}@{host}:{port}/{dbname}?sslmode=require"
         return dsn
     return ""
+
+
+def _init_geo_tables() -> None:
+    """Create minimal tables for Phase 1 routing foundation if they don't exist.
+
+    Tables:
+      - address_cache: normalized address, raw components, lat/lng, confidence, provider, updated_at
+      - customer_locations: customer key/name mapped to address_cache entry
+      - distance_cache: cached distance/time between two keys (e.g., normalized addresses)
+      - depot_config: configured depot location
+    """
+    dsn = _build_supabase_dsn()
+    if not dsn:
+        # Running without DB configured – skip silently per PRD graceful degradation
+        print("[routing:init] No DB configured; skipping table initialization")
+        return
+    ddl_statements = [
+        # Address cache keyed by normalized address
+        (
+            "address_cache",
+            """
+            create table if not exists address_cache (
+                id bigserial primary key,
+                normalized text unique not null,
+                street text,
+                suite text,
+                city text,
+                state text,
+                zip text,
+                country text default 'USA',
+                latitude double precision,
+                longitude double precision,
+                confidence double precision,
+                provider text,
+                updated_at timestamp without time zone default now()
+            );
+            """,
+        ),
+        # Customer to address mapping
+        (
+            "customer_locations",
+            """
+            create table if not exists customer_locations (
+                id bigserial primary key,
+                customer_key text not null,
+                normalized_address text not null,
+                address_id bigint references address_cache(id) on delete set null,
+                updated_at timestamp without time zone default now(),
+                unique(customer_key)
+            );
+            """,
+        ),
+        # Distance cache between two normalized addresses (directed pair + provider)
+        (
+            "distance_cache",
+            """
+            create table if not exists distance_cache (
+                origin_normalized text not null,
+                dest_normalized text not null,
+                provider text not null,
+                distance_miles double precision,
+                duration_minutes double precision,
+                updated_at timestamp without time zone default now(),
+                primary key (origin_normalized, dest_normalized, provider)
+            );
+            """,
+        ),
+        # Depot configuration (single row expected)
+        (
+            "depot_config",
+            """
+            create table if not exists depot_config (
+                id smallint primary key default 1,
+                name text,
+                address text,
+                latitude double precision,
+                longitude double precision,
+                updated_at timestamp without time zone default now()
+            );
+            """,
+        ),
+    ]
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                for _name, ddl in ddl_statements:
+                    cur.execute(ddl)
+            conn.commit()
+        print("[routing:init] Geo tables ensured")
+    except Exception as exc:
+        # Do not crash app; PRD requires graceful degradation without DB
+        print(f"[routing:init] Failed to ensure tables: {exc}")
 
 
 @app.get("/health")
@@ -256,6 +355,164 @@ async def optimize(
     )
 
 
+@app.on_event("startup")
+def _startup_init() -> None:
+    # Ensure geo/routing tables exist (graceful if DB not configured)
+    _init_geo_tables()
+
+
+@app.post("/geocode/validate")
+async def geocode_validate(
+    file: UploadFile = File(...),
+    planningWhse: Optional[str] = Form("ZAC"),
+) -> Dict[str, Any]:
+    """Phase 1: extract addresses, geocode via Google if key present, and cache results.
+
+    If GOOGLE_MAPS_API_KEY is not configured, returns detected addresses without lat/lng.
+    """
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=400, detail="Only .xlsx files are supported")
+    try:
+        content: bytes = await file.read()
+        buffer = BytesIO(content)
+        df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
+    df = compute_calculated_fields(df)
+
+    addrs = extract_unique_addresses(df)
+
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    dsn = _build_supabase_dsn()
+    enriched: List[Dict[str, Any]] = []
+    for a in addrs:
+        item: Dict[str, Any] = dict(a)
+        cached = cache_lookup_address(dsn, a.get("normalized") or "")
+        if cached:
+            item.update({
+                "latitude": cached.get("latitude"),
+                "longitude": cached.get("longitude"),
+                "confidence": cached.get("confidence"),
+                "provider": cached.get("provider"),
+                "source": "cache",
+            })
+        elif api_key:
+            try:
+                q = build_address_query(a)
+                lat, lng, conf, provider, _fmt = google_geocode_query(
+                    q, api_key)
+                item.update({
+                    "latitude": lat,
+                    "longitude": lng,
+                    "confidence": conf,
+                    "provider": provider,
+                    "source": "google",
+                })
+                cache_upsert_address(dsn, a.get(
+                    "normalized") or "", a, lat, lng, conf, provider)
+            except Exception as _exc:
+                item.update({"error": "GEOCODE_FAILED"})
+        else:
+            item.update({"note": "No API key configured"})
+        enriched.append(item)
+
+    return {"count": len(enriched), "addresses": enriched}
+
+
+@app.post("/distance-matrix")
+async def distance_matrix(
+    origins: str = Form(...),  # "lat,lng|lat,lng|..."
+    destinations: str = Form(...),
+) -> Dict[str, Any]:
+    """Compute distance and duration matrices. Uses Google if key exists; fallback to Haversine.
+
+    Accepts pipe-separated lat,lng pairs for origins and destinations.
+    """
+    def parse(s: str) -> List[tuple[float, float]]:
+        out: List[tuple[float, float]] = []
+        for tok in (s or "").split("|"):
+            tok = tok.strip()
+            if not tok:
+                continue
+            parts = tok.split(",")
+            if len(parts) != 2:
+                continue
+            try:
+                out.append((float(parts[0]), float(parts[1])))
+            except Exception:
+                continue
+        return out
+
+    o = parse(origins)
+    d = parse(destinations)
+    if not o or not d:
+        raise HTTPException(status_code=400, detail="Invalid origins/destinations")
+
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    try:
+        if api_key:
+            dist, dur = google_distance_matrix(api_key, o, d)
+        else:
+            # Combine and compute Haversine with 1.25 inflation; then slice into o x d
+            coords = o + d
+            full_dist, full_dur = haversine_matrix(coords)
+            n_o = len(o)
+            n_d = len(d)
+            dist = [row[n_o:n_o + n_d] for row in full_dist[:n_o]]
+            dur = [row[n_o:n_o + n_d] for row in full_dur[:n_o]]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Distance matrix failed: {exc}")
+
+    return {"distance_miles": dist, "duration_minutes": dur}
+
+
+@app.get("/depot/location")
+def depot_get() -> Dict[str, Any]:
+    dsn = _build_supabase_dsn()
+    if not dsn:
+        return {"id": 1, "name": "Fort Worth, TX", "address": "1155 NE 28th Street Fort Worth TX, 76106"}
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select id, name, address, latitude, longitude from depot_config where id=1")
+                row = cur.fetchone()
+                if not row:
+                    return {"id": 1, "name": None, "address": None, "latitude": None, "longitude": None}
+                return {"id": row[0], "name": row[1], "address": row[2], "latitude": row[3], "longitude": row[4]}
+    except Exception:
+        return {"id": 1, "name": None, "address": None, "latitude": None, "longitude": None}
+
+
+@app.put("/depot/location")
+def depot_put(name: Optional[str] = Form(None), address: Optional[str] = Form(None), latitude: Optional[float] = Form(None), longitude: Optional[float] = Form(None)) -> Dict[str, Any]:
+    dsn = _build_supabase_dsn()
+    if not dsn:
+        # Accept but do not persist when DB is not configured
+        return {"ok": True, "id": 1, "name": name, "address": address, "latitude": latitude, "longitude": longitude}
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into depot_config (id, name, address, latitude, longitude)
+                    values (1, %s, %s, %s, %s)
+                    on conflict (id) do update set name=excluded.name, address=excluded.address,
+                        latitude=excluded.latitude, longitude=excluded.longitude, updated_at=now()
+                    """,
+                    (name, address, latitude, longitude),
+                )
+            conn.commit()
+        return {"ok": True}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save depot: {exc}")
 @app.post("/route/plan", response_model=OptimizeResponse)
 async def route_plan(
     file: UploadFile = File(...),
@@ -279,14 +536,16 @@ async def route_plan(
     """
     filename = file.filename or ""
     if not filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
+        raise HTTPException(
+            status_code=400, detail="Only .xlsx files are supported")
 
     try:
         content: bytes = await file.read()
         buffer = BytesIO(content)
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
     # Align with Upload/Optimize filters first
     if planningWhse:
@@ -338,15 +597,18 @@ async def route_plan(
     try:
         trucks_df, assigns_df = naive_grouping(df, cfg)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Routing plan failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Routing plan failed: {exc}") from exc
 
     sections: Dict[str, List[int]] = {}
     if not trucks_df.empty:
         for bucket, g in trucks_df.groupby("priorityBucket"):
             sections[str(bucket)] = list(map(int, g["truckNumber"].tolist()))
 
-    trucks_list = trucks_df.to_dict(orient="records") if not trucks_df.empty else []
-    assigns_list = assigns_df.to_dict(orient="records") if not assigns_df.empty else []
+    trucks_list = trucks_df.to_dict(
+        orient="records") if not trucks_df.empty else []
+    assigns_list = assigns_df.to_dict(
+        orient="records") if not assigns_df.empty else []
 
     # Clean NaNs like in /optimize
     for assign in assigns_list:
@@ -361,8 +623,10 @@ async def route_plan(
         if pd.isna(assign.get('remainingPieces')):
             assign['remainingPieces'] = 0
 
-    trucks_models: List[TruckSummary] = [TruckSummary(**{str(k): v for k, v in t.items()}) for t in trucks_list]
-    assigns_models: List[LineAssignment] = [LineAssignment(**{str(k): v for k, v in a.items()}) for a in assigns_list]
+    trucks_models: List[TruckSummary] = [TruckSummary(
+        **{str(k): v for k, v in t.items()}) for t in trucks_list]
+    assigns_models: List[LineAssignment] = [LineAssignment(
+        **{str(k): v for k, v in a.items()}) for a in assigns_list]
 
     return OptimizeResponse(
         trucks=trucks_models,
