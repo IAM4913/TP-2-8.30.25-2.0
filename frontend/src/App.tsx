@@ -6,6 +6,7 @@ import FileUpload from './components/FileUpload';
 import Dashboard from './components/Dashboard';
 import TruckResults from './components/TruckResults';
 import RouteManagement from './components/RouteManagement';
+import RouteSetup from './components/RouteSetup';
 import { OptimizeResponse, WeightConfig, CombineTrucksRequest } from './types';
 import { combineTrucks } from './api';
 
@@ -244,6 +245,10 @@ function App() {
                                 />
                             )
                         }
+                    />
+                    <Route
+                        path="/route-setup"
+                        element={<RouteSetup weightConfig={weightConfig} file={uploadedFile} onRoutePlanned={(res) => setOptimizeResults(res)} />}
                     />
                     <Route
                         path="/results"
