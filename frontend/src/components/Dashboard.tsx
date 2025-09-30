@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Settings, Play, Loader2, Warehouse as WarehouseIcon } from 'lucide-react';
+import { Settings, Play, Loader2, Warehouse as WarehouseIcon, MapPin } from 'lucide-react';
+import AddressValidation from './AddressValidation';
+import { useNavigate } from 'react-router-dom';
 import { optimizeRoutes } from '../api';
 import { WeightConfig, OptimizeResponse } from '../types';
 
@@ -18,6 +20,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 }) => {
     const [optimizing, setOptimizing] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const navigate = useNavigate();
     const [planningWhse, setPlanningWhse] = useState<string>(() => {
         if (typeof window !== 'undefined') {
             const saved = localStorage.getItem('planningWhse');
@@ -160,6 +163,11 @@ const Dashboard: React.FC<DashboardProps> = ({
                 </div>
             </div>
 
+            {/* Address Validation Panel per PRD Phase 1 */}
+            <div className="mb-8">
+                <AddressValidation file={file} />
+            </div>
+
             {error && (
                 <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
                     <div className="text-red-700">{error}</div>
@@ -167,23 +175,33 @@ const Dashboard: React.FC<DashboardProps> = ({
             )}
 
             <div className="text-center">
-                <button
-                    onClick={handleOptimize}
-                    disabled={optimizing}
-                    className="inline-flex items-center px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                    {optimizing ? (
-                        <>
-                            <Loader2 className="animate-spin h-5 w-5 mr-2" />
-                            Optimizing Routes...
-                        </>
-                    ) : (
-                        <>
-                            <Play className="h-5 w-5 mr-2" />
-                            Optimize Routes
-                        </>
-                    )}
-                </button>
+                <div className="inline-flex gap-3">
+                    <button
+                        onClick={handleOptimize}
+                        disabled={optimizing}
+                        className="inline-flex items-center px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        {optimizing ? (
+                            <>
+                                <Loader2 className="animate-spin h-5 w-5 mr-2" />
+                                Optimizing Routes...
+                            </>
+                        ) : (
+                            <>
+                                <Play className="h-5 w-5 mr-2" />
+                                Optimize
+                            </>
+                        )}
+                    </button>
+                    <button
+                        onClick={() => navigate('/route-setup')}
+                        className="inline-flex items-center px-6 py-3 bg-emerald-600 text-white font-semibold rounded-lg hover:bg-emerald-700"
+                        title="Go to Route setup"
+                    >
+                        <MapPin className="h-5 w-5 mr-2" />
+                        Route
+                    </button>
+                </div>
             </div>
         </div>
     );
