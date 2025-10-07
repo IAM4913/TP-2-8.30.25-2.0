@@ -31,6 +31,7 @@ from .geocode_service import (
     build_address_query,
 )
 from .distance_service import google_distance_matrix, haversine_matrix
+from .vrp_solver import Stop, Route, solve_vrp
 
 
 REQUIRED_COLUMNS_MAPPED: List[str] = [
@@ -434,6 +435,7 @@ async def distance_matrix(
 ) -> Dict[str, Any]:
     """Compute distance and duration matrices. Uses Google if key exists; fallback to Haversine.
 
+    Caches results in distance_cache table to avoid repeated API calls.
     Accepts pipe-separated lat,lng pairs for origins and destinations.
     """
     def parse(s: str) -> List[tuple[float, float]]:
@@ -451,48 +453,184 @@ async def distance_matrix(
                 continue
         return out
 
+    def normalize_coord(lat: float, lng: float) -> str:
+        """Normalize coordinate to 4 decimal places for cache key."""
+        return f"{lat:.4f},{lng:.4f}"
+
     o = parse(origins)
     d = parse(destinations)
     if not o or not d:
-        raise HTTPException(status_code=400, detail="Invalid origins/destinations")
+        raise HTTPException(
+            status_code=400, detail="Invalid origins/destinations")
 
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    try:
-        if api_key:
-            dist, dur = google_distance_matrix(api_key, o, d)
-        else:
-            # Combine and compute Haversine with 1.25 inflation; then slice into o x d
-            coords = o + d
-            full_dist, full_dur = haversine_matrix(coords)
-            n_o = len(o)
-            n_d = len(d)
-            dist = [row[n_o:n_o + n_d] for row in full_dist[:n_o]]
-            dur = [row[n_o:n_o + n_d] for row in full_dur[:n_o]]
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Distance matrix failed: {exc}")
+    provider = "google" if api_key else "haversine"
+    dsn = _build_supabase_dsn()
+
+    # Check cache first
+    dist: List[List[float]] = [
+        [0.0 for _ in range(len(d))] for _ in range(len(o))]
+    dur: List[List[float]] = [
+        [0.0 for _ in range(len(d))] for _ in range(len(o))]
+    cache_misses: List[tuple[int, int]] = []
+
+    if dsn:
+        try:
+            with psycopg.connect(dsn, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    for i, orig in enumerate(o):
+                        for j, dest in enumerate(d):
+                            orig_key = normalize_coord(orig[0], orig[1])
+                            dest_key = normalize_coord(dest[0], dest[1])
+                            cur.execute(
+                                """
+                                select distance_miles, duration_minutes 
+                                from distance_cache 
+                                where origin_normalized = %s and dest_normalized = %s and provider = %s
+                                """,
+                                (orig_key, dest_key, provider)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                dist[i][j] = float(row[0] or 0.0)
+                                dur[i][j] = float(row[1] or 0.0)
+                            else:
+                                cache_misses.append((i, j))
+        except Exception as exc:
+            print(f"[distance-matrix] Cache lookup failed: {exc}")
+            # If cache fails, treat everything as cache miss
+            cache_misses = [(i, j) for i in range(len(o))
+                            for j in range(len(d))]
+    else:
+        # No database, compute everything
+        cache_misses = [(i, j) for i in range(len(o)) for j in range(len(d))]
+
+    # Compute cache misses
+    if cache_misses:
+        try:
+            if api_key:
+                try:
+                    # Build origins/destinations lists for just the misses
+                    # For efficiency, if we have many misses, just call the full matrix
+                    if len(cache_misses) > len(o) * len(d) * 0.5:
+                        # More than half are misses, compute full matrix
+                        full_dist, full_dur = google_distance_matrix(
+                            api_key, o, d)
+                        for i in range(len(o)):
+                            for j in range(len(d)):
+                                dist[i][j] = full_dist[i][j]
+                                dur[i][j] = full_dur[i][j]
+                    else:
+                        # Compute individual pairs (less efficient but saves API quota)
+                        for i, j in cache_misses:
+                            pair_dist, pair_dur = google_distance_matrix(
+                                api_key, [o[i]], [d[j]])
+                            dist[i][j] = pair_dist[0][0]
+                            dur[i][j] = pair_dur[0][0]
+                except Exception as gexc:
+                    # Graceful fallback to Haversine if Google call fails
+                    print(
+                        f"[distance-matrix] Google failed; falling back to Haversine: {gexc}")
+                    from .distance_service import haversine_matrix
+                    coords = o + d
+                    full_dist, full_dur = haversine_matrix(coords)
+                    n_o = len(o)
+                    n_d = len(d)
+                    for i in range(n_o):
+                        for j in range(n_d):
+                            dist[i][j] = full_dist[i][j + n_o]
+                            dur[i][j] = full_dur[i][j + n_o]
+                    provider = "haversine"
+            else:
+                # No API key, use Haversine
+                from .distance_service import haversine_matrix
+                coords = o + d
+                full_dist, full_dur = haversine_matrix(coords)
+                n_o = len(o)
+                n_d = len(d)
+                for i in range(n_o):
+                    for j in range(n_d):
+                        dist[i][j] = full_dist[i][j + n_o]
+                        dur[i][j] = full_dur[i][j + n_o]
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Distance matrix failed: {exc}")
+
+        # Cache the newly computed values
+        if dsn and cache_misses:
+            try:
+                with psycopg.connect(dsn, connect_timeout=5) as conn:
+                    with conn.cursor() as cur:
+                        for i, j in cache_misses:
+                            orig_key = normalize_coord(o[i][0], o[i][1])
+                            dest_key = normalize_coord(d[j][0], d[j][1])
+                            cur.execute(
+                                """
+                                insert into distance_cache (origin_normalized, dest_normalized, provider, distance_miles, duration_minutes)
+                                values (%s, %s, %s, %s, %s)
+                                on conflict (origin_normalized, dest_normalized, provider) 
+                                do update set distance_miles = excluded.distance_miles, 
+                                             duration_minutes = excluded.duration_minutes,
+                                             updated_at = now()
+                                """,
+                                (orig_key, dest_key, provider,
+                                 dist[i][j], dur[i][j])
+                            )
+                    conn.commit()
+                print(
+                    f"[distance-matrix] Cached {len(cache_misses)} new distance calculations")
+            except Exception as exc:
+                print(f"[distance-matrix] Cache write failed: {exc}")
 
     return {"distance_miles": dist, "duration_minutes": dur}
 
 
 @app.get("/depot/location")
 def depot_get() -> Dict[str, Any]:
+    default_depot = {
+        "id": 1,
+        "name": "28",
+        "address": "1155 NE 28th Street Fort Worth Tx 76106",
+        "latitude": None,
+        "longitude": None,
+    }
     dsn = _build_supabase_dsn()
     if not dsn:
-        return {"id": 1, "name": "Fort Worth, TX", "address": "1155 NE 28th Street Fort Worth TX, 76106"}
+        return default_depot
     try:
         with psycopg.connect(dsn, connect_timeout=5) as conn:
             with conn.cursor() as cur:
-                cur.execute("select id, name, address, latitude, longitude from depot_config where id=1")
+                cur.execute(
+                    "select id, name, address, latitude, longitude from depot_config where id=1")
                 row = cur.fetchone()
                 if not row:
-                    return {"id": 1, "name": None, "address": None, "latitude": None, "longitude": None}
+                    return default_depot
                 return {"id": row[0], "name": row[1], "address": row[2], "latitude": row[3], "longitude": row[4]}
     except Exception:
-        return {"id": 1, "name": None, "address": None, "latitude": None, "longitude": None}
+        return default_depot
 
 
 @app.put("/depot/location")
 def depot_put(name: Optional[str] = Form(None), address: Optional[str] = Form(None), latitude: Optional[float] = Form(None), longitude: Optional[float] = Form(None)) -> Dict[str, Any]:
+    # If address is provided but no coordinates, try to geocode it
+    if address and (latitude is None or longitude is None):
+        api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        if api_key:
+            try:
+                lat, lng, conf, provider, _fmt = google_geocode_query(
+                    address, api_key)
+                latitude = lat
+                longitude = lng
+                print(f"[depot:put] Geocoded depot address to {lat}, {lng}")
+            except Exception as exc:
+                print(f"[depot:put] Failed to geocode depot address: {exc}")
+
+    # Default to Fort Worth if still no coordinates
+    if latitude is None or latitude == 0:
+        latitude = 32.795580
+    if longitude is None or longitude == 0:
+        longitude = -97.281410
+
     dsn = _build_supabase_dsn()
     if not dsn:
         # Accept but do not persist when DB is not configured
@@ -512,7 +650,168 @@ def depot_put(name: Optional[str] = Form(None), address: Optional[str] = Form(No
             conn.commit()
         return {"ok": True}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to save depot: {exc}")
+        # Graceful degradation per PRD: do not error if DB is unreachable/misconfigured
+        # Return submitted values marked as not persisted
+        print(f"[depot:put] Skipping persist; DB unavailable: {exc}")
+        return {
+            "ok": True,
+            "id": 1,
+            "name": name,
+            "address": address,
+            "latitude": latitude,
+            "longitude": longitude,
+            "note": "not persisted (DB unavailable)",
+        }
+
+
+@app.post("/route/optimize-phase2")
+async def route_optimize_phase2(
+    file: UploadFile = File(...),
+    planningWhse: Optional[str] = Form("ZAC"),
+    maxWeightPerTruck: Optional[int] = Form(52000),
+    maxStopsPerTruck: Optional[int] = Form(20),
+    maxDriveTimeMinutes: Optional[int] = Form(720),  # 12 hours default
+    serviceTimePerStopMinutes: Optional[int] = Form(30),  # 30 min per stop
+) -> Dict[str, Any]:
+    """Phase 2: Geographic clustering + TSP route optimization.
+
+    Returns optimized routes with stop sequences and map visualization data.
+    """
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=400, detail="Only .xlsx files are supported")
+
+    try:
+        content: bytes = await file.read()
+        buffer = BytesIO(content)
+        df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+
+    # Filter by planning warehouse
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
+
+    df = compute_calculated_fields(df)
+
+    # Extract and geocode addresses
+    addrs = extract_unique_addresses(df)
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    dsn = _build_supabase_dsn()
+
+    # Geocode all addresses
+    geocoded_addrs: List[Dict[str, Any]] = []
+    for a in addrs:
+        cached = cache_lookup_address(dsn, a.get("normalized") or "")
+        if cached and cached.get("latitude") and cached.get("longitude"):
+            geocoded_addrs.append({
+                **a,
+                "latitude": cached["latitude"],
+                "longitude": cached["longitude"],
+                "confidence": cached.get("confidence", 0.0),
+            })
+        elif api_key:
+            try:
+                q = build_address_query(a)
+                lat, lng, conf, provider, _fmt = google_geocode_query(
+                    q, api_key)
+                geocoded_addrs.append({
+                    **a,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "confidence": conf,
+                })
+                cache_upsert_address(dsn, a.get(
+                    "normalized") or "", a, lat, lng, conf, provider)
+            except Exception:
+                continue
+
+    if not geocoded_addrs:
+        raise HTTPException(
+            status_code=400, detail="No addresses could be geocoded")
+
+    # Get depot location
+    depot = depot_get()
+    depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
+    depot_lng = depot.get("longitude") if depot.get(
+        "longitude") else -97.281410
+
+    # Build distance matrix (depot + all geocoded addresses)
+    coords = [(depot_lat, depot_lng)] + [(a["latitude"], a["longitude"])
+                                         for a in geocoded_addrs]
+
+    # Try Google Distance Matrix, fallback to Haversine
+    try:
+        if api_key:
+            dist_matrix, dur_matrix = google_distance_matrix(
+                api_key, coords, coords)
+        else:
+            dist_matrix, dur_matrix = haversine_matrix(coords)
+    except Exception:
+        dist_matrix, dur_matrix = haversine_matrix(coords)
+
+    # Create Stop objects for route optimization
+    stops: List[Stop] = []
+    for idx, addr in enumerate(geocoded_addrs):
+        # Find matching orders for this address
+        addr_key = addr.get("normalized", "")
+        matching_rows = df[
+            (df["shipping_city"].str.lower() == str(addr.get("city", "")).lower()) &
+            (df["shipping_state"].str.upper() ==
+             str(addr.get("state", "")).upper())
+        ]
+
+        if matching_rows.empty:
+            continue
+
+        # Aggregate weight and pieces for this address
+        total_weight = float(matching_rows["Ready Weight"].sum())
+        total_pieces = int(matching_rows["RPcs"].sum())
+
+        # Use first matching row for order details
+        first_row = matching_rows.iloc[0]
+
+        stops.append(Stop(
+            customer_name=str(first_row.get("Customer", "")),
+            address=addr.get("street", "") or addr.get("normalized", ""),
+            city=addr.get("city", ""),
+            state=addr.get("state", ""),
+            latitude=addr["latitude"],
+            longitude=addr["longitude"],
+            weight=total_weight,
+            pieces=total_pieces,
+            order_id=str(first_row.get("SO", "")),
+            line_id=str(first_row.get("Line", "")),
+        ))
+
+    if not stops:
+        raise HTTPException(status_code=400, detail="No valid stops found")
+
+    # Plan routes using OR-Tools VRP solver
+    routes = solve_vrp(
+        stops=stops,
+        depot_lat=depot_lat,
+        depot_lng=depot_lng,
+        distance_matrix=dist_matrix,
+        duration_matrix=dur_matrix,
+        max_weight_per_truck=float(maxWeightPerTruck or 52000),
+        max_drive_time_minutes=float(maxDriveTimeMinutes or 720),
+        service_time_per_stop_minutes=float(serviceTimePerStopMinutes or 30),
+    )
+
+    return {
+        "success": True,
+        "routes": [r.to_dict() for r in routes],
+        "depot": {"latitude": depot_lat, "longitude": depot_lng, "name": depot.get("name")},
+        "total_trucks": len(routes),
+        "total_stops": len(stops),
+    }
+
+
 @app.post("/route/plan", response_model=OptimizeResponse)
 async def route_plan(
     file: UploadFile = File(...),

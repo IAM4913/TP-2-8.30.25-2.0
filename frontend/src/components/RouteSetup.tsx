@@ -91,7 +91,7 @@ const RouteSetup: React.FC<RouteSetupProps> = ({ weightConfig, file, onRoutePlan
                 otherMaxWeight: config.otherMaxWeight,
             });
             onRoutePlanned(results);
-            navigate('/routes');
+            navigate('/routing-phase1');
         } catch (e: any) {
             console.error('Route plan failed', e);
             setError(e?.response?.data?.detail || e?.message || 'Route planning failed');

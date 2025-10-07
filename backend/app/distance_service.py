@@ -92,9 +92,9 @@ def haversine_matrix(
         for j in range(n):
             if i == j:
                 continue
-            d = haversine_miles(coords[i][0], coords[i][1], coords[j][0], coords[j][1]) * factor
+            d = haversine_miles(
+                coords[i][0], coords[i][1], coords[j][0], coords[j][1]) * factor
             dist[i][j] = d
             dur[i][j] = driving_time_estimate_minutes(d, avg_speed_mph)
     return dist, dur
-
 

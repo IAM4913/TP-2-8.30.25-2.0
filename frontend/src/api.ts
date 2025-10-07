@@ -6,7 +6,8 @@ import { UploadPreviewResponse, OptimizeResponse, CombineTrucksRequest, CombineT
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
 const api = axios.create({
     baseURL: apiBaseUrl,
-    timeout: 45000,
+    // Large Excel previews can take time; allow up to 3 minutes
+    timeout: 180000,
 });
 
 export const uploadPreview = async (file: File): Promise<UploadPreviewResponse> => {
@@ -146,5 +147,43 @@ export const combineTrucks = async (
         },
     });
 
+    return response.data;
+};
+
+// Phase 1: Distance Matrix API (geographic foundation)
+export const distanceMatrix = async (
+    origins: Array<[number, number]>,
+    destinations: Array<[number, number]>
+): Promise<{ distance_miles: number[][]; duration_minutes: number[][] }> => {
+    const fmt = (pairs: Array<[number, number]>) => pairs.map(([lat, lng]) => `${lat},${lng}`).join('|');
+    const form = new FormData();
+    form.append('origins', fmt(origins));
+    form.append('destinations', fmt(destinations));
+    const res = await api.post('/distance-matrix', form, { headers: { 'Content-Type': 'multipart/form-data' } });
+    return res.data;
+};
+
+// Phase 2: Route Optimization API
+export const optimizeRoutesPhase2 = async (
+    file: File,
+    opts?: {
+        planningWhse?: string;
+        maxWeightPerTruck?: number;
+        maxStopsPerTruck?: number;
+        maxDriveTimeMinutes?: number;
+        serviceTimePerStopMinutes?: number;
+    }
+): Promise<any> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (opts?.planningWhse) formData.append('planningWhse', opts.planningWhse);
+    if (opts?.maxWeightPerTruck) formData.append('maxWeightPerTruck', String(opts.maxWeightPerTruck));
+    if (opts?.maxStopsPerTruck) formData.append('maxStopsPerTruck', String(opts.maxStopsPerTruck));
+    if (opts?.maxDriveTimeMinutes) formData.append('maxDriveTimeMinutes', String(opts.maxDriveTimeMinutes));
+    if (opts?.serviceTimePerStopMinutes) formData.append('serviceTimePerStopMinutes', String(opts.serviceTimePerStopMinutes));
+
+    const response = await api.post('/route/optimize-phase2', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+    });
     return response.data;
 };

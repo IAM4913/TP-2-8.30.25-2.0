@@ -120,3 +120,4 @@ def build_address_query(parts: Dict[str, Optional[str]]) -> str:
     comps = [parts.get("street"), parts.get("city"),
              parts.get("state"), parts.get("zip"), "USA"]
     return ", ".join([c for c in comps if c and str(c).strip()])
+

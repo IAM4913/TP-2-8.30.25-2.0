@@ -1,11 +1,12 @@
 
 import { useState } from 'react';
 import { Routes, Route, useNavigate, useLocation } from 'react-router-dom';
-import { Truck, Upload, Settings, MapPin as RouteIcon, BarChart3 } from 'lucide-react';
+import { Truck, Upload, Settings, MapPin as RouteIcon, BarChart3, MapPin } from 'lucide-react';
 import FileUpload from './components/FileUpload';
 import Dashboard from './components/Dashboard';
 import TruckResults from './components/TruckResults';
 import RouteManagement from './components/RouteManagement';
+import RoutingPhase1 from './components/RoutingPhase1';
 import RouteSetup from './components/RouteSetup';
 import { OptimizeResponse, WeightConfig, CombineTrucksRequest } from './types';
 import { combineTrucks } from './api';
@@ -186,6 +187,16 @@ function App() {
                                 <Upload className="h-4 w-4 mr-1" />
                                 Upload & Optimize
                             </button>
+                            <button
+                                onClick={() => navigate('/routing-phase1')}
+                                className={`flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors ${location.pathname === '/routing-phase1'
+                                    ? 'bg-blue-100 text-blue-700'
+                                    : 'text-gray-700 hover:text-gray-900 hover:bg-gray-100'
+                                    }`}
+                            >
+                                <MapPin className="h-4 w-4 mr-1" />
+                                Routing (Phase 1)
+                            </button>
                             {optimizeResults && (
                                 <>
                                     <button
@@ -245,6 +256,10 @@ function App() {
                                 />
                             )
                         }
+                    />
+                    <Route
+                        path="/routing-phase1"
+                        element={<RoutingPhase1 sharedFile={uploadedFile} />}
                     />
                     <Route
                         path="/route-setup"

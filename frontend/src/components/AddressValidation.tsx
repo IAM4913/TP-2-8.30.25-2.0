@@ -70,7 +70,7 @@ const AddressValidation: React.FC<AddressValidationProps> = ({ file }) => {
                             <div className="text-xl font-semibold">{results.count}</div>
                         </div>
                         <div className="bg-green-50 p-3 rounded">
-                            <div className="text-sm text-green-700 flex items-center"><CheckCircle2 className="h-4 w-4 mr-1" /> Valid (>= 0.8)</div>
+                            <div className="text-sm text-green-700 flex items-center"><CheckCircle2 className="h-4 w-4 mr-1" /> Valid (≥ 0.8)</div>
                             <div className="text-xl font-semibold text-green-800">{validCount}</div>
                         </div>
                         <div className="bg-yellow-50 p-3 rounded">
