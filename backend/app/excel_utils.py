@@ -78,7 +78,7 @@ def _norm_key(s: Any) -> str:
 
 def _find_planning_whse_col(df: pd.DataFrame) -> Optional[str]:
     """Find the Planning Warehouse column regardless of case/spacing/variants."""
-    normalized = { _norm_key(c): c for c in df.columns }
+    normalized = {_norm_key(c): c for c in df.columns}
     # Preferred direct matches
     for target in ("planningwhse", "planningwarehouse", "planningwhs", "planningwhsecode"):
         if target in normalized:
@@ -93,6 +93,42 @@ def _find_planning_whse_col(df: pd.DataFrame) -> Optional[str]:
 def filter_by_planning_whse(df: pd.DataFrame, allowed_values: Iterable[str] = ("ZAC",)) -> pd.DataFrame:
     """Return only rows where Planning Whse matches one of allowed_values (case-insensitive). If column not found, return original df unmodified."""
     col = _find_planning_whse_col(df)
+    if not col:
+        return df
+    allowed = {str(v).strip().upper() for v in allowed_values}
+    series = df[col].astype(str).str.strip().str.upper()
+    mask = series.isin(list(allowed))
+    return df.loc[mask].reset_index(drop=True)
+
+
+# ---- Credit status helpers ----
+def _find_credit_status_col(df: pd.DataFrame) -> Optional[str]:
+    """Find the credit status column regardless of case/spacing/variants.
+
+    Looks for columns like: Credit, Credit Status, CreditStatus, Credit Hold.
+    """
+    normalized = {_norm_key(c): c for c in df.columns}
+    # Preferred direct matches
+    for target in ("credit", "creditstatus", "creditcode", "credithold", "crstatus"):
+        if target in normalized:
+            return normalized[target]
+    # Fallbacks: any column containing the token 'credit'
+    for nk, orig in normalized.items():
+        if "credit" in nk:
+            return orig
+    return None
+
+
+def filter_by_credit_status(
+    df: pd.DataFrame,
+    allowed_values: Iterable[str] = ("A",),
+) -> pd.DataFrame:
+    """Keep only rows whose credit status is in allowed_values (case-insensitive).
+
+    If a credit column cannot be found, returns the original DataFrame unmodified.
+    Example: allowed_values=("A",) keeps only available credit rows and drops holds like "H".
+    """
+    col = _find_credit_status_col(df)
     if not col:
         return df
     allowed = {str(v).strip().upper() for v in allowed_values}
