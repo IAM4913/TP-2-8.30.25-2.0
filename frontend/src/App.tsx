@@ -1,8 +1,9 @@
 
 import { useState } from 'react';
 import { Routes, Route, useNavigate, useLocation } from 'react-router-dom';
-import { Truck, Upload, Settings, MapPin as RouteIcon, BarChart3 } from 'lucide-react';
+import { Truck, Upload, Database, Settings, MapPin as RouteIcon, BarChart3 } from 'lucide-react';
 import FileUpload from './components/FileUpload';
+import DatabaseQuery from './components/DatabaseQuery';
 import Dashboard from './components/Dashboard';
 import TruckResults from './components/TruckResults';
 import RouteManagement from './components/RouteManagement';
@@ -10,6 +11,7 @@ import { OptimizeResponse, WeightConfig, CombineTrucksRequest } from './types';
 import { combineTrucks } from './api';
 
 function App() {
+    const [dataSource, setDataSource] = useState<'file' | 'database'>('file');
     const [uploadedFile, setUploadedFile] = useState<File | null>(null);
     const [optimizeResults, setOptimizeResults] = useState<OptimizeResponse | null>(null);
     const [weightConfig, setWeightConfig] = useState<WeightConfig>({
@@ -30,6 +32,12 @@ function App() {
 
     const handleOptimizeComplete = (results: OptimizeResponse) => {
         setOptimizeResults(results);
+    };
+
+    const handleDataSourceChange = (source: 'file' | 'database') => {
+        setDataSource(source);
+        setUploadedFile(null);
+        setOptimizeResults(null);
     };
 
     const handleTrucksCombined = async (combinedTruckIds: number[], selectedLineIds: string[]) => {
@@ -223,15 +231,49 @@ function App() {
                     <Route
                         path="/"
                         element={
-                            !uploadedFile ? (
-                                <FileUpload onFileUploaded={handleFileUploaded} />
-                            ) : !optimizeResults ? (
-                                <Dashboard
-                                    file={uploadedFile}
-                                    weightConfig={weightConfig}
-                                    onWeightConfigChange={setWeightConfig}
-                                    onOptimizeComplete={handleOptimizeComplete}
-                                />
+                            !optimizeResults ? (
+                                <div>
+                                    {/* Data Source Selector */}
+                                    <div className="flex gap-4 mb-8 justify-center">
+                                        <button
+                                            onClick={() => handleDataSourceChange('file')}
+                                            className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition-all ${dataSource === 'file'
+                                                    ? 'bg-blue-600 text-white shadow-lg'
+                                                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                }`}
+                                        >
+                                            <Upload className="h-5 w-5" />
+                                            Upload File
+                                        </button>
+
+                                        <button
+                                            onClick={() => handleDataSourceChange('database')}
+                                            className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition-all ${dataSource === 'database'
+                                                    ? 'bg-blue-600 text-white shadow-lg'
+                                                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                }`}
+                                        >
+                                            <Database className="h-5 w-5" />
+                                            Query Database
+                                        </button>
+                                    </div>
+
+                                    {/* Conditional Content Based on Data Source */}
+                                    {dataSource === 'file' ? (
+                                        !uploadedFile ? (
+                                            <FileUpload onFileUploaded={handleFileUploaded} />
+                                        ) : (
+                                            <Dashboard
+                                                file={uploadedFile}
+                                                weightConfig={weightConfig}
+                                                onWeightConfigChange={setWeightConfig}
+                                                onOptimizeComplete={handleOptimizeComplete}
+                                            />
+                                        )
+                                    ) : (
+                                        <DatabaseQuery onOptimizeComplete={handleOptimizeComplete} />
+                                    )}
+                                </div>
                             ) : (
                                 <TruckResults
                                     results={optimizeResults}

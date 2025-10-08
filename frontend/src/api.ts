@@ -93,3 +93,43 @@ export const combineTrucks = async (
 
     return response.data;
 };
+
+export const checkDatabaseStatus = async (): Promise<{ configured: boolean; connected: boolean; server?: string; database?: string }> => {
+    const response = await api.get('/db/mssql/status');
+    const data = response.data;
+
+    // Transform backend response to match frontend expectations
+    return {
+        configured: data.status !== 'not_configured',
+        connected: data.status === 'connected',
+        server: data.server,
+        database: data.database
+    };
+};
+
+export const optimizeFromDatabase = async (opts?: {
+    planningWhse?: string;
+    earliestShipDate?: string;
+    tableName?: string;
+    whereClause?: string;
+}): Promise<OptimizeResponse> => {
+    const formData = new FormData();
+    formData.append('planningWhse', opts?.planningWhse || 'ZAC');
+    if (opts?.earliestShipDate) {
+        formData.append('earliest_ship_date', opts.earliestShipDate);
+    }
+    if (opts?.tableName) {
+        formData.append('table_name', opts.tableName);
+    }
+    if (opts?.whereClause) {
+        formData.append('where_clause', opts.whereClause);
+    }
+
+    const response = await api.post('/optimize/from-db', formData, {
+        headers: {
+            'Content-Type': 'multipart/form-data',
+        },
+    });
+
+    return response.data;
+};

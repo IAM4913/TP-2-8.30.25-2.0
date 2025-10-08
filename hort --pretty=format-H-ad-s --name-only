@@ -1,0 +1,144 @@
+37ba86677894bbf8b4ff0e8462c5036f42f42eb8|2025-09-21|Add UPDATE.md summarizing recent commits
+UPDATE.md
+
+581a2124ea34085a6ba5d2847418bbbb0d167ea2|2025-09-20|Truck summary: split counts and date ranges into separate rows
+frontend/src/components/TruckResults.tsx
+
+27ab1787aa34f4b3732e09172f7121f6338b753d|2025-09-20|Truck summary: show earliest/latest ship date ranges
+frontend/src/components/TruckResults.tsx
+
+819848ec28405814afffc6234e016a9a3b7d00d5|2025-09-18|Frontend: add axios timeout to prevent stuck upload spinner
+frontend/src/api.ts
+
+edadc46a17a67b7ed146a51bed3f8ac3a4b31f64|2025-09-18|Plan Loads: show unique truck count and date in CSV filename
+frontend/src/components/TruckResults.tsx
+
+5e2490809ad3207bbc7b26d74b971b359b87604c|2025-09-18|Include trttav_no from source into LineAssignment and API
+backend/app/main.py
+backend/app/optimizer_simple.py
+backend/app/schemas.py
+
+9dfd0af5eb1fa01551e576cb5596bcd59da6aeba|2025-09-18|Plan Loads: multi-truck selection, select-none, CSV export
+frontend/src/components/TruckResults.tsx
+frontend/src/types.ts
+
+57de14f4ea2c8009fc8dc636de0e18aa20d6ab07|2025-09-18|Add Vercel Analytics and wire into app
+frontend/package-lock.json
+frontend/package.json
+frontend/src/main.tsx
+
+6eaecd894216dda0362c6a1644b0c6061d6a3da9|2025-09-10|fix(backend): correct uvicorn module path in Procfile (app.main:app)
+backend/Procfile
+
+f66d28d87fbdc393e4f0bc90280c57010c0a5380|2025-09-10|fix(backend): resolve pip conflicts; use single psycopg[binary]==3.2.9 and python-dotenv entry
+backend/requirements.txt
+
+6572af0f85d2fb706340297122a8a9c436bdb6e4|2025-09-10|chore(backend): add Procfile and deployment deps (dotenv, psycopg[binary])
+backend/Procfile
+backend/requirements.txt
+
+ebbeba1290bf61bfba2642666df6d7b6f2cdba33|2025-09-10|chore(frontend): include vite/client types in tsconfig for import.meta.env
+frontend/tsconfig.json
+
+5968b91e77c92fcdb7794ae3acb484507c85cf16|2025-09-10|chore(frontend): add Vite env typings for import.meta.env (vite-env.d.ts)
+frontend/src/vite-env.d.ts
+
+36a5d879fb06032de401bef55584daa69d28f892|2025-09-10|merge: feat/new-ui-and-optimizations into main
+eb4d0839eb54f9a308ec9271a798093e38f326b0|2025-09-10|chore(frontend): read API base from VITE_API_BASE_URL for Vercel
+frontend/src/api.ts
+
+5569f86d54bc5dda885b93db44a4a0454b280b30|2025-09-10|feat: route management complete; backend endpoints; dev/run fixes; docs
+.gitignore
+TRUCK_PLANNER_PRD.md
+_inspect.py
+backend/app/main.py
+backend/app/optimizer.py
+backend/app/optimizer_simple.py
+backend/app/schemas.py
+backend/requirements.txt
+backend/run_dev.ps1
+docs/truck-planner-prd.md
+docs/truck-routing-logic.md
+headers.txt
+optimize.json
+test_optimize.ps1
+test_optimize_file.ps1
+
+51b77875cca16e141037784841ed999160df2acf|2025-09-02|DH Load List: R# from R, PRV column, on-transport BPCS/Bal Weight; Calibri 11 + left align; cross-bucket fill and fixes
+backend/app/main.py
+backend/app/optimizer_simple.py
+frontend/src/App.tsx
+
+02c00d125dd06cb89353d97e40e654d480a65f70|2025-09-01|DH Load List: sort loads by percent utilization (desc) before writing rows
+backend/app/main.py
+
+5a0078daf9b9b008788cbbe132a2f51773e1e2c7|2025-09-01|Combine Trucks: backend endpoint + frontend state merge to reflect combined loads; pass planningWhse to backend
+backend/app/main.py
+frontend/src/App.tsx
+frontend/src/api.ts
+
+a0c1df21b0d7872bf9d70ad1b92797481b38b155|2025-09-01|DH Load List: add blue info row per load (italic) with late status, total ready weight, max weight, utilization %, overwidth; auto-fit column widths
+backend/app/main.py
+
+0ce3fe098176ea7b1a0ed794aa12d01e8a3047ce|2025-09-01|UI: DH Load List export defaults to next business day without prompt
+frontend/src/components/TruckResults.tsx
+
+ce1628dca4d9187986c775e9ff08cb1ae545c9b5|2025-09-01|Frontend: persist Planning Whse and pass to exports; Backend: ensure exports filter by planningWhse; DH Load List formatting and filter consistency
+README.md
+backend/app/main.py
+frontend/src/api.ts
+frontend/src/components/Dashboard.tsx
+frontend/src/components/RouteManagement.tsx
+frontend/src/components/TruckResults.tsx
+questions.md
+
+4246eb82b3c2ac4b34ea69e5aa5e895c28c03cd7|2025-08-31|docs(prd): update PRD to reflect current MVP features, endpoints, and route management
+truck-scheduler-prd.md
+
+87b89412b06bf756eac04a2c8a9b2e0d1e23b734|2025-08-31|feat: new UI components, route management, and optimizer updates\n\n- Add RouteManagement component and wire into dashboard\n- Update TruckResults and API typing\n- Improve backend optimizer and schemas\n- Update build config and deps\n- Add DEVELOPMENT_STATUS notes\n\nRefs: #new-ui #optimizer
+.gitignore
+DEVELOPMENT_STATUS.md
+backend/app/excel_utils.py
+backend/app/main.py
+backend/app/optimizer_simple.py
+backend/app/schemas.py
+frontend/package-lock.json
+frontend/package.json
+frontend/src/App.tsx
+frontend/src/api.ts
+frontend/src/components/Dashboard.tsx
+frontend/src/components/RouteManagement.tsx
+frontend/src/components/TruckResults.tsx
+frontend/src/types.ts
+frontend/vite.config.ts
+optimize.json
+
+0b493c1bba9d274c71e7eab00eedbdcae071df5a|2025-08-30|Initial commit: Truck Planner application with FastAPI backend and React frontend
+.gitignore
+README.md
+backend/app/__init__.py
+backend/app/excel_utils.py
+backend/app/main.py
+backend/app/optimizer.py
+backend/app/optimizer_simple.py
+backend/app/schemas.py
+backend/requirements.txt
+backend/run_dev.ps1
+frontend/index.html
+frontend/package-lock.json
+frontend/package.json
+frontend/postcss.config.js
+frontend/run_dev.ps1
+frontend/src/App.tsx
+frontend/src/api.ts
+frontend/src/components/Dashboard.tsx
+frontend/src/components/FileUpload.tsx
+frontend/src/components/TruckResults.tsx
+frontend/src/index.css
+frontend/src/main.tsx
+frontend/src/types.ts
+frontend/tailwind.config.js
+frontend/tsconfig.json
+frontend/tsconfig.node.json
+frontend/vite.config.ts
+truck-scheduler-prd.md

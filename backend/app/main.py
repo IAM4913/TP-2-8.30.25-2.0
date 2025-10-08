@@ -20,6 +20,8 @@ from .schemas import (
 )
 from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
+from .db_config import SQLServerConfig, DataSourceAdapter
+from .field_mappings import apply_field_mapping
 from dotenv import load_dotenv  # new
 import os
 import psycopg
@@ -116,7 +118,8 @@ def db_ping() -> Dict[str, Any]:
     """
     dsn = _build_supabase_dsn()
     if not dsn:
-        raise HTTPException(status_code=500, detail="Database connection not configured. Set SUPABASE_DB_URL or SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD.")
+        raise HTTPException(
+            status_code=500, detail="Database connection not configured. Set SUPABASE_DB_URL or SUPABASE_DB_HOST + SUPABASE_DB_PASSWORD.")
     try:
         with psycopg.connect(dsn, connect_timeout=5) as conn:
             with conn.cursor() as cur:
@@ -124,7 +127,218 @@ def db_ping() -> Dict[str, Any]:
                 version, now_val = cur.fetchone()
         return {"ok": True, "version": str(version), "now": str(now_val)}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"DB ping failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"DB ping failed: {exc}") from exc
+
+
+@app.get("/db/mssql/status")
+def mssql_status() -> Dict[str, Any]:
+    """Check SQL Server connection status."""
+    config = SQLServerConfig()
+
+    if not config.is_configured():
+        return {
+            "status": "not_configured",
+            "message": "SQL Server not configured. Set MSSQL_* environment variables.",
+            "server": None,
+            "database": None
+        }
+
+    try:
+        if config.test_connection():
+            return {
+                "status": "connected",
+                "server": config.server,
+                "database": config.database,
+                "port": config.port
+            }
+        else:
+            return {
+                "status": "connection_failed",
+                "server": config.server,
+                "database": config.database,
+                "error": "Connection test failed"
+            }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "server": config.server,
+            "database": config.database,
+            "error": str(exc)
+        }
+
+
+@app.get("/db/mssql/preview")
+def mssql_preview(
+    table_name: str = "dbo.transports",
+    limit: int = 10,
+    where_clause: Optional[str] = None
+) -> Dict[str, Any]:
+    """Preview data from SQL Server table."""
+    config = SQLServerConfig()
+
+    if not config.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="SQL Server not configured. Set MSSQL_* environment variables."
+        )
+
+    try:
+        # Build query with optional WHERE clause
+        query = f"SELECT TOP {limit} * FROM {table_name}"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+
+        df = DataSourceAdapter.from_sql_server(
+            config=config,
+            query=query
+        )
+
+        # Convert to records for JSON response
+        records = df.head(limit).to_dict(orient="records")
+        columns = df.columns.tolist()
+
+        return {
+            "status": "success",
+            "table": table_name,
+            "row_count": len(df),
+            "columns": columns,
+            "sample_data": records
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to preview data: {str(exc)}"
+        ) from exc
+
+
+@app.post("/optimize/from-db", response_model=OptimizeResponse)
+async def optimize_from_db(
+    planningWhse: str = Form("ZAC"),
+    earliest_ship_date: Optional[str] = Form(None),
+    table_name: str = Form("dbo.transports"),
+    where_clause: Optional[str] = Form(None)
+) -> OptimizeResponse:
+    """Run truck optimization directly from SQL Server data."""
+    config = SQLServerConfig()
+
+    if not config.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="SQL Server not configured. Set MSSQL_* environment variables."
+        )
+
+    try:
+        # Build query with optional date filter
+        query = f"SELECT * FROM {table_name}"
+        where_parts = []
+
+        if earliest_ship_date:
+            where_parts.append(f"due_dt >= '{earliest_ship_date}'")
+
+        if where_clause:
+            where_parts.append(f"({where_clause})")
+
+        if where_parts:
+            query += " WHERE " + " AND ".join(where_parts)
+
+        # Fetch data from SQL Server
+        df = DataSourceAdapter.from_sql_server(
+            config=config,
+            query=query
+        )
+
+        if df.empty:
+            raise HTTPException(
+                status_code=400,
+                detail="No data found matching the criteria"
+            )
+
+        # Apply field mapping to rename columns to match optimization engine
+        apply_field_mapping(df)
+
+        # Apply field calculations and filtering (same as file upload)
+        df = compute_calculated_fields(df)
+
+        # Only filter by planning warehouse if not "ALL"
+        if planningWhse and planningWhse.upper() != "ALL":
+            df = filter_by_planning_whse(df, (planningWhse,))
+            if df.empty:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No data found for Planning Warehouse: {planningWhse}"
+                )
+
+        if df.empty:
+            raise HTTPException(
+                status_code=400,
+                detail="No data found matching the criteria"
+            )
+
+        # Validate required columns
+        missing = [
+            col for col in REQUIRED_COLUMNS_MAPPED if col not in df.columns]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required columns after field mapping: {', '.join(missing)}"
+            )
+
+        # Run optimization
+        weight_config = {
+            "texas_max_lbs": 52000,
+            "texas_min_lbs": 47000,
+            "other_max_lbs": 48000,
+            "other_min_lbs": 44000,
+        }
+        trucks_df, assigns_df = naive_grouping(df, weight_config)
+
+        # Build sections mapping (same as file upload)
+        sections: Dict[str, List[int]] = {}
+        if not trucks_df.empty:
+            for bucket, g in trucks_df.groupby("priorityBucket"):
+                sections[str(bucket)] = list(
+                    map(int, g["truckNumber"].tolist()))
+
+        # Convert DataFrames to proper format
+        trucks_list = trucks_df.to_dict(
+            orient="records") if not trucks_df.empty else []
+        assigns_list = assigns_df.to_dict(
+            orient="records") if not assigns_df.empty else []
+
+        # Clean up NaN values in assignments (same as file upload)
+        for assign in assigns_list:
+            if pd.isna(assign.get('isRemainder')):
+                assign['isRemainder'] = False
+            if pd.isna(assign.get('isPartial')):
+                assign['isPartial'] = False
+            if pd.isna(assign.get('parentLine')):
+                assign['parentLine'] = None
+            if pd.isna(assign.get('remainingPieces')):
+                assign['remainingPieces'] = 0
+
+        # Create typed models (same as file upload)
+        trucks_models: List[TruckSummary] = [TruckSummary(
+            **{str(k): v for k, v in t.items()}) for t in trucks_list]
+        assigns_models: List[LineAssignment] = [LineAssignment(
+            **{str(k): v for k, v in a.items()}) for a in assigns_list]
+
+        return OptimizeResponse(
+            trucks=trucks_models,
+            assignments=assigns_models,
+            sections=sections,
+            totalTrucks=len(trucks_models),
+            message=f"Successfully optimized {len(trucks_models)} trucks from database"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Optimization from database failed: {str(exc)}"
+        ) from exc
 
 
 @app.post("/upload/preview", response_model=UploadPreviewResponse)
@@ -149,7 +363,8 @@ async def upload_preview(file: UploadFile = File(...)) -> UploadPreviewResponse:
     missing = [col for col in REQUIRED_COLUMNS_MAPPED if col not in headers]
 
     # Provide a small sample for UI validation
-    sample_records = df.head(5).to_dict(orient="records") if not df.empty else []
+    sample_records = df.head(5).to_dict(
+        orient="records") if not df.empty else []
 
     # Normalize sample keys to strings
     norm_sample: List[Dict[str, Any]] = []
@@ -219,9 +434,11 @@ async def optimize(
         for bucket, g in trucks_df.groupby("priorityBucket"):
             sections[str(bucket)] = list(map(int, g["truckNumber"].tolist()))
 
-    trucks_list = trucks_df.to_dict(orient="records") if not trucks_df.empty else []
-    assigns_list = assigns_df.to_dict(orient="records") if not assigns_df.empty else []
-    
+    trucks_list = trucks_df.to_dict(
+        orient="records") if not trucks_df.empty else []
+    assigns_list = assigns_df.to_dict(
+        orient="records") if not assigns_df.empty else []
+
     # Clean up NaN values in assignments before creating Pydantic models
     for assign in assigns_list:
         # Handle NaN values for boolean fields
@@ -235,10 +452,12 @@ async def optimize(
         # Handle NaN values for integer fields
         if pd.isna(assign.get('remainingPieces')):
             assign['remainingPieces'] = 0
-    
+
     # Ensure JSON-serializable keys and create typed models
-    trucks_models: List[TruckSummary] = [TruckSummary(**{str(k): v for k, v in t.items()}) for t in trucks_list]
-    assigns_models: List[LineAssignment] = [LineAssignment(**{str(k): v for k, v in a.items()}) for a in assigns_list]
+    trucks_models: List[TruckSummary] = [TruckSummary(
+        **{str(k): v for k, v in t.items()}) for t in trucks_list]
+    assigns_models: List[LineAssignment] = [LineAssignment(
+        **{str(k): v for k, v in a.items()}) for a in assigns_list]
 
     return OptimizeResponse(
         trucks=trucks_models,
@@ -338,7 +557,8 @@ async def combine_trucks(
     try:
         req = CombineTrucksRequest.model_validate_json(request)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Invalid request: {exc}") from exc
 
     # Load Excel
     try:
@@ -346,7 +566,8 @@ async def combine_trucks(
         buffer = BytesIO(content)
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
     # Compute fields and optimize (deterministic grouping)
     # Optional: filter to Planning Whse to align with UI selection
@@ -365,7 +586,8 @@ async def combine_trucks(
     try:
         trucks_df, assigns_df = naive_grouping(df.copy(), cfg)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Optimization failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Optimization failed: {exc}") from exc
 
     if trucks_df.empty or assigns_df.empty:
         return CombineTrucksResponse(success=False, message="No trucks or assignments to combine", updatedAssignments=[], removedTruckIds=[])
@@ -388,13 +610,15 @@ async def combine_trucks(
     assigns_df = assigns_df.copy()
     assigns_df["__so_key__"] = assigns_df["so"].map(as_str)
     assigns_df["__line_key__"] = assigns_df["line"].map(as_str)
-    mask_selected = assigns_df.apply(lambda r: (r["__so_key__"], r["__line_key__"]) in sel_pairs, axis=1)
+    mask_selected = assigns_df.apply(lambda r: (
+        r["__so_key__"], r["__line_key__"]) in sel_pairs, axis=1)
     selected_rows = assigns_df[mask_selected]
     if selected_rows.empty:
         return CombineTrucksResponse(success=False, message="Selected lines not found in current optimization", updatedAssignments=[], removedTruckIds=[])
 
     # Determine candidate trucks and target (lightest among involved)
-    involved_trucks = sorted(set(int(t) for t in selected_rows["truckNumber"].tolist()))
+    involved_trucks = sorted(set(int(t)
+                             for t in selected_rows["truckNumber"].tolist()))
     trucks_sub = trucks_df[trucks_df["truckNumber"].isin(involved_trucks)]
     if trucks_sub.empty:
         return CombineTrucksResponse(success=False, message="Candidate trucks not found", updatedAssignments=[], removedTruckIds=[])
@@ -413,12 +637,14 @@ async def combine_trucks(
 
     # Determine removed trucks (those that had only selected lines)
     remaining_by_truck = assigns_df.groupby("truckNumber").size()
-    removed = [t for t in source_trucks_before if t != target_truck and t not in remaining_by_truck.index.tolist()]
+    removed = [t for t in source_trucks_before if t !=
+               target_truck and t not in remaining_by_truck.index.tolist()]
 
     # Recompute target truck summary from its assignments
     t_assigns = assigns_df[assigns_df["truckNumber"] == target_truck].copy()
     # Determine state and limits from any row
-    any_state = str(t_assigns["customerState"].iloc[0]) if not t_assigns.empty else ""
+    any_state = str(t_assigns["customerState"].iloc[0]
+                    ) if not t_assigns.empty else ""
     is_texas = str(any_state).strip().upper() in {"TX", "TEXAS"}
     max_weight = cfg["texas_max_lbs"] if is_texas else cfg["other_max_lbs"]
     min_weight = cfg["texas_min_lbs"] if is_texas else cfg["other_min_lbs"]
@@ -427,11 +653,14 @@ async def combine_trucks(
     total_lines = int(t_assigns.shape[0])
     total_orders = int(t_assigns["so"].nunique())
     max_width = float(t_assigns["width"].max()) if not t_assigns.empty else 0.0
-    contains_late = bool(t_assigns["isLate"].any()) if "isLate" in t_assigns.columns else False
+    contains_late = bool(t_assigns["isLate"].any(
+    )) if "isLate" in t_assigns.columns else False
     priority_bucket = "Late" if contains_late else "WithinWindow"
     # Use first destination/customer for summary context
-    customer_name = str(t_assigns["customerName"].iloc[0]) if not t_assigns.empty else ""
-    customer_city = str(t_assigns["customerCity"].iloc[0]) if not t_assigns.empty else ""
+    customer_name = str(
+        t_assigns["customerName"].iloc[0]) if not t_assigns.empty else ""
+    customer_city = str(
+        t_assigns["customerCity"].iloc[0]) if not t_assigns.empty else ""
     customer_state = any_state
     zone_val = None
     route_val = None
@@ -458,7 +687,8 @@ async def combine_trucks(
 
     # Build updated assignments for changed trucks only
     changed_trucks = set(source_trucks_before) | {target_truck}
-    updated_assignments_rows = assigns_df[assigns_df["truckNumber"].isin(list(changed_trucks))]
+    updated_assignments_rows = assigns_df[assigns_df["truckNumber"].isin(
+        list(changed_trucks))]
     updated_assignments: List[LineAssignment] = []
     for _, a in updated_assignments_rows.iterrows():
         tnum_val = a.get("truckNumber")
@@ -470,7 +700,8 @@ async def combine_trucks(
             truckNumber=tnum_int,
             so=str(a.get("so")),
             line=str(a.get("line")),
-            trttav_no=str(a.get("trttav_no")) if pd.notna(a.get("trttav_no")) else None,
+            trttav_no=str(a.get("trttav_no")) if pd.notna(
+                a.get("trttav_no")) else None,
             customerName=str(a.get("customerName")),
             customerAddress=a.get("customerAddress"),
             customerCity=str(a.get("customerCity")),
@@ -482,8 +713,10 @@ async def combine_trucks(
             width=float(a.get("width") or 0.0),
             isOverwidth=bool(a.get("isOverwidth", False)),
             isLate=bool(a.get("isLate", False)),
-            earliestDue=str(a.get("earliestDue")) if pd.notna(a.get("earliestDue")) else None,
-            latestDue=str(a.get("latestDue")) if pd.notna(a.get("latestDue")) else None,
+            earliestDue=str(a.get("earliestDue")) if pd.notna(
+                a.get("earliestDue")) else None,
+            latestDue=str(a.get("latestDue")) if pd.notna(
+                a.get("latestDue")) else None,
         ))
 
     return CombineTrucksResponse(
@@ -508,14 +741,16 @@ async def export_dh_load_list(
     - Adds hidden blank column C to match provided layout
     """
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
+        raise HTTPException(
+            status_code=400, detail="Only .xlsx files are supported")
 
     try:
         content: bytes = await file.read()
         buffer = BytesIO(content)
         df: pd.DataFrame = pd.read_excel(buffer, engine="openpyxl")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
     # Apply Planning Whse filter first (default ZAC); if missing column, no-op
     if planningWhse:
@@ -601,11 +836,13 @@ async def export_dh_load_list(
     has_planned_col = False
 
     # Optimize to get trucks and line splits (pieces/weights per transport)
-    cfg = {"texas_max_lbs": 52000, "texas_min_lbs": 47000, "other_max_lbs": 48000, "other_min_lbs": 44000}
+    cfg = {"texas_max_lbs": 52000, "texas_min_lbs": 47000,
+           "other_max_lbs": 48000, "other_min_lbs": 44000}
     try:
         trucks_df, assigns_df = naive_grouping(df.copy(), cfg)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Optimization failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Optimization failed: {exc}") from exc
 
     # Column normalization helpers
     def norm_key(s: Any) -> str:
@@ -629,18 +866,21 @@ async def export_dh_load_list(
     # Source columns
     col_type = find_col("type")
     col_bpcs = find_col("bpcs")  # BPcs totals per input line
-    col_bal_weight = find_col("balweight") or find_col("balanceweight") or find_col("bal weight")
+    col_bal_weight = find_col("balweight") or find_col(
+        "balanceweight") or find_col("bal weight")
     col_frm = find_col("frm")
     col_grd = find_col("grd")
     col_size = find_col("size")
     col_width = find_col("width") or "Width"
     col_lgth = find_col("lgth") or find_col("length")
-    col_trttav = find_col("trttavno", contains_ok=False) or find_col("trttavno")
+    col_trttav = find_col(
+        "trttavno", contains_ok=False) or find_col("trttavno")
     # Exact 'R' column from input for R# mapping
     col_r = find_col("r", contains_ok=False)
     col_latest_due = find_col("latestdue") or "Latest Due"
     col_earliest_due_src = find_col("earliestdue") or "Earliest Due"
-    col_customer = find_col("customer", contains_ok=False) or find_col("customer")
+    col_customer = find_col(
+        "customer", contains_ok=False) or find_col("customer")
     col_so = find_col("so", contains_ok=False) or "SO"
     col_line = find_col("line", contains_ok=False) or "Line"
     whse_col = _find_planning_whse_col(df)
@@ -651,22 +891,28 @@ async def export_dh_load_list(
         keyed["__so_key__"] = keyed[col_so].astype(str)
         keyed["__line_key__"] = keyed[col_line].astype(str)
     except Exception:
-        keyed["__so_key__"] = keyed["SO"].astype(str) if "SO" in keyed.columns else pd.Series([None]*len(keyed), dtype="string")
-        keyed["__line_key__"] = keyed["Line"].astype(str) if "Line" in keyed.columns else pd.Series([None]*len(keyed), dtype="string")
+        keyed["__so_key__"] = keyed["SO"].astype(
+            str) if "SO" in keyed.columns else pd.Series([None]*len(keyed), dtype="string")
+        keyed["__line_key__"] = keyed["Line"].astype(
+            str) if "Line" in keyed.columns else pd.Series([None]*len(keyed), dtype="string")
     index_map: Dict[tuple, Dict[str, Any]] = {}
     for _, r in keyed.iterrows():
-        index_map[(str(r.get("__so_key__")), str(r.get("__line_key__")))] = r.to_dict()
+        index_map[(str(r.get("__so_key__")), str(
+            r.get("__line_key__")))] = r.to_dict()
 
     # Quick truck meta
     zones_by_truck: Dict[int, Optional[str]] = {}
     routes_by_truck: Dict[int, Optional[str]] = {}
     if not trucks_df.empty:
         for _, trow in trucks_df.iterrows():
-            tnum = int(trow["truckNumber"]) if pd.notna(trow.get("truckNumber")) else None
+            tnum = int(trow["truckNumber"]) if pd.notna(
+                trow.get("truckNumber")) else None
             if tnum is None:
                 continue
-            zones_by_truck[tnum] = None if pd.isna(trow.get("zone")) else str(trow.get("zone"))
-            routes_by_truck[tnum] = None if pd.isna(trow.get("route")) else str(trow.get("route"))
+            zones_by_truck[tnum] = None if pd.isna(
+                trow.get("zone")) else str(trow.get("zone"))
+            routes_by_truck[tnum] = None if pd.isna(
+                trow.get("route")) else str(trow.get("route"))
 
     headers = [
         "Actual Ship", "TR#", "Carrier", "Loaded", "Shipped", "Earliest Ship Date", "Ship Date", "Customer", "Type",
@@ -703,7 +949,8 @@ async def export_dh_load_list(
             subset_tmp = assigns_df[assigns_df["truckNumber"] == tnum_i]
             bucket_val = "WithinWindow"
             if "priorityBucket" in subset_tmp.columns:
-                vals = subset_tmp["priorityBucket"].dropna().astype(str).tolist()
+                vals = subset_tmp["priorityBucket"].dropna().astype(
+                    str).tolist()
                 if any(v == "Late" for v in vals):
                     bucket_val = "Late"
                 elif any(v == "NearDue" for v in vals):
@@ -712,10 +959,12 @@ async def export_dh_load_list(
                 bucket_val = "Late"
             bucket_by_truck[tnum_i] = bucket_val
     # Helper to build rows for a given ordered list of trucks
+
     def build_rows_for(truck_order: List[int]) -> tuple[List[List[Any]], List[int], List[float]]:
         rows_local: List[List[Any]] = []
         sep_indices: List[int] = []
         sep_utils: List[float] = []
+
         def to_int(v: Any) -> Optional[int]:
             try:
                 if v is None or (hasattr(pd, 'isna') and pd.isna(v)):
@@ -723,6 +972,7 @@ async def export_dh_load_list(
                 return int(float(v))
             except Exception:
                 return None
+
         def to_float(v: Any) -> Optional[float]:
             try:
                 if v is None or (hasattr(pd, 'isna') and pd.isna(v)):
@@ -737,7 +987,8 @@ async def export_dh_load_list(
             # Compute per-load Actual Ship per rules:
             # - If any line is Late -> next business day
             # - Else -> day after latest Earliest Due among lines in this load
-            contains_late_subset = bool(subset["isLate"].any()) if "isLate" in subset.columns else False
+            contains_late_subset = bool(
+                subset["isLate"].any()) if "isLate" in subset.columns else False
             if contains_late_subset:
                 truck_actual_ship = as_dt(next_business_day())
             else:
@@ -745,7 +996,8 @@ async def export_dh_load_list(
                 ed_series = None
                 if "earliestDue" in subset.columns:
                     try:
-                        ed_series = pd.to_datetime(subset["earliestDue"], errors="coerce")
+                        ed_series = pd.to_datetime(
+                            subset["earliestDue"], errors="coerce")
                     except Exception:
                         ed_series = None
                 # Fallback to source 'Earliest Due' via index_map
@@ -757,11 +1009,13 @@ async def export_dh_load_list(
                         # Strip remainder suffixes for index_map lookup since source data doesn't have them
                         line_for_lookup = line
                         if line and line.endswith(('-R1', '-R2', '-R3', '-R4', '-R5', '-R6', '-R7', '-R8', '-R9')):
-                            line_for_lookup = line[:-3]  # Remove the -RX suffix
+                            # Remove the -RX suffix
+                            line_for_lookup = line[:-3]
                         src = index_map.get((so, line_for_lookup), {})
                         ed_vals.append(src.get(col_earliest_due_src))
                     try:
-                        ed_series = pd.to_datetime(pd.Series(ed_vals), errors="coerce")
+                        ed_series = pd.to_datetime(
+                            pd.Series(ed_vals), errors="coerce")
                     except Exception:
                         ed_series = pd.Series([], dtype="datetime64[ns]")
                 if ed_series.dropna().empty:
@@ -773,7 +1027,8 @@ async def export_dh_load_list(
                     truck_actual_ship = next_business_day_after(max_ed)
                     # If this date is in the past, move it 3 business days into the future from today
                     try:
-                        tas = pd.to_datetime(truck_actual_ship, errors="coerce")
+                        tas = pd.to_datetime(
+                            truck_actual_ship, errors="coerce")
                         today = pd.Timestamp.today().normalize()
                         if pd.notna(tas) and tas < today:
                             truck_actual_ship = add_business_days(today, 3)
@@ -786,20 +1041,25 @@ async def export_dh_load_list(
                 line_for_export = line
                 line_for_lookup = line
                 if line and line.endswith(('-R1', '-R2', '-R3', '-R4', '-R5', '-R6', '-R7', '-R8', '-R9')):
-                    line_for_export = line[:-3]  # Remove the -RX suffix for export
-                    line_for_lookup = line[:-3]  # Remove the -RX suffix for index_map lookup
+                    # Remove the -RX suffix for export
+                    line_for_export = line[:-3]
+                    # Remove the -RX suffix for index_map lookup
+                    line_for_lookup = line[:-3]
                 cust = str(a.get("customerName"))
                 src = index_map.get((so, line_for_lookup), {})
-                ship_date = src.get(col_latest_due) if col_latest_due in src else src.get("Latest Due")
+                ship_date = src.get(
+                    col_latest_due) if col_latest_due in src else src.get("Latest Due")
                 # as_dt defined above
                 # Use on-transport values for counts and weights (no SO line quantities)
                 bpcs_val = int(a.get("piecesOnTransport") or 0)
                 bal_weight_val = float(a.get("totalWeight") or 0.0)
                 # Frm: pull from source as-is (case-insensitive), do not force numeric
                 frm_val = src.get(col_frm) if col_frm else None
-                grd_val = src.get(col_grd) if col_grd else None  # keep as-is (text in data rows)
+                # keep as-is (text in data rows)
+                grd_val = src.get(col_grd) if col_grd else None
                 size_val = src.get(col_size) if col_size else None
-                width_val = to_float(src.get(col_width)) if (col_width and col_width in src) else to_float(a.get("width"))
+                width_val = to_float(src.get(col_width)) if (
+                    col_width and col_width in src) else to_float(a.get("width"))
                 lgth_val = to_float(src.get(col_lgth)) if col_lgth else None
                 d_val = src.get(col_trttav) if col_trttav else None
                 # R#: from source 'R' column, if present
@@ -807,10 +1067,12 @@ async def export_dh_load_list(
                 if col_r and col_r in src:
                     rnum_val = to_int(src.get(col_r))
                 # PRV: 1 for data lines with weight
-                prv_val = 1 if float(a.get("totalWeight") or 0.0) > 0.0 else None
+                prv_val = 1 if float(a.get("totalWeight")
+                                     or 0.0) > 0.0 else None
                 # Get earliest ship date from source data
-                earliest_ship_date = src.get(col_earliest_due_src) if col_earliest_due_src in src else src.get("Earliest Due")
-                
+                earliest_ship_date = src.get(
+                    col_earliest_due_src) if col_earliest_due_src in src else src.get("Earliest Due")
+
                 row = [
                     truck_actual_ship,
                     int(truck_num),
@@ -841,17 +1103,21 @@ async def export_dh_load_list(
                 ]
                 rows_local.append(row)
             # Info row
-            total_ready_weight = float(subset["totalWeight"].sum()) if "totalWeight" in subset.columns else float(trucks_meta.get(int(truck_num), {}).get("totalWeight", 0.0))
+            total_ready_weight = float(subset["totalWeight"].sum()) if "totalWeight" in subset.columns else float(
+                trucks_meta.get(int(truck_num), {}).get("totalWeight", 0.0))
             meta = trucks_meta.get(int(truck_num), {})
             max_weight = float(meta.get("maxWeight", 0.0))
-            contains_late = bool(meta.get("containsLate", False)) or (bool(subset["isLate"].any()) if "isLate" in subset.columns else False)
+            contains_late = bool(meta.get("containsLate", False)) or (
+                bool(subset["isLate"].any()) if "isLate" in subset.columns else False)
             max_width = float(meta.get("maxWidth", 0.0))
             if "width" in subset.columns and not subset.empty:
                 try:
-                    max_width = max(float(x) for x in subset["width"].tolist() if pd.notna(x))
+                    max_width = max(float(x)
+                                    for x in subset["width"].tolist() if pd.notna(x))
                 except Exception:
                     pass
-            pct_util = (total_ready_weight / max_weight * 100.0) if max_weight > 0 else 0.0
+            pct_util = (total_ready_weight / max_weight *
+                        100.0) if max_weight > 0 else 0.0
             late_status = "Late" if contains_late else "On time"
             overwidth_status = "Overwidth" if max_width > 96 else "Not Overwidth"
             sep_row = cast(List[Any], [None] * len(headers))
@@ -875,10 +1141,14 @@ async def export_dh_load_list(
             except Exception:
                 continue
             subset_tmp = assigns_df[assigns_df["truckNumber"] == tnum_i]
-            total_ready_weight_tmp = float(subset_tmp["totalWeight"].sum()) if "totalWeight" in subset_tmp.columns else float(trucks_meta.get(int(tnum_i), {}).get("totalWeight", 0.0))
-            max_weight_tmp = float(trucks_meta.get(int(tnum_i), {}).get("maxWeight", 0.0))
-            util_by_truck[tnum_i] = (total_ready_weight_tmp / max_weight_tmp) if max_weight_tmp > 0 else 0.0
-    sorted_trucks = sorted(util_by_truck.keys(), key=lambda k: util_by_truck.get(k, 0.0), reverse=True)
+            total_ready_weight_tmp = float(subset_tmp["totalWeight"].sum()) if "totalWeight" in subset_tmp.columns else float(
+                trucks_meta.get(int(tnum_i), {}).get("totalWeight", 0.0))
+            max_weight_tmp = float(trucks_meta.get(
+                int(tnum_i), {}).get("maxWeight", 0.0))
+            util_by_truck[tnum_i] = (
+                total_ready_weight_tmp / max_weight_tmp) if max_weight_tmp > 0 else 0.0
+    sorted_trucks = sorted(util_by_truck.keys(
+    ), key=lambda k: util_by_truck.get(k, 0.0), reverse=True)
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Define sheets and included buckets
@@ -887,7 +1157,8 @@ async def export_dh_load_list(
             ("WithinWindow", {"WithinWindow"}),
         ]
         for sheet, include in sheets_spec:
-            truck_order = [tn for tn in sorted_trucks if bucket_by_truck.get(int(tn), "WithinWindow") in include]
+            truck_order = [tn for tn in sorted_trucks if bucket_by_truck.get(
+                int(tn), "WithinWindow") in include]
             rows_local, sep_indices, sep_utils = build_rows_for(truck_order)
             out_df = pd.DataFrame(rows_local, columns=headers)
             out_df.to_excel(writer, sheet_name=sheet, index=False)
@@ -902,10 +1173,12 @@ async def export_dh_load_list(
 
             # Bold header
             for c in range(1, ws.max_column + 1):
-                ws.cell(row=1, column=c).font = Font(name="Calibri", size=11, bold=True)
+                ws.cell(row=1, column=c).font = Font(
+                    name="Calibri", size=11, bold=True)
 
             # Shade and italicize only the separator/info rows in light blue
-            fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+            fill = PatternFill(start_color="DCE6F1",
+                               end_color="DCE6F1", fill_type="solid")
             for idx in sep_indices:
                 excel_row = 2 + idx  # header is row 1
                 if excel_row <= ws.max_row:
@@ -942,10 +1215,12 @@ async def export_dh_load_list(
                             color = "FFFFC000"  # yellow
                         else:
                             color = "FFFF0000"  # red
-                        cell.font = Font(name="Calibri", size=11, italic=True, color=color)
+                        cell.font = Font(name="Calibri", size=11,
+                                         italic=True, color=color)
 
             # Apply numeric formats to non-date numeric columns
-            int_cols = ["TR#", "R#", "BPCS", "RPCS", "PRV"]  # Do not force numeric on Frm; it may be text in source
+            # Do not force numeric on Frm; it may be text in source
+            int_cols = ["TR#", "R#", "BPCS", "RPCS", "PRV"]
             float_cols = ["Bal Weight", "Ready Weight", "Width", "Lgth"]
             # Treat RPCS specially: only format as number if the cell is numeric (for data rows, RPCS is not used; sep rows contain text)
             for hdr in int_cols:
@@ -970,7 +1245,8 @@ async def export_dh_load_list(
                 for c in range(1, ws.max_column + 1):
                     cell = ws.cell(row=r, column=c)
                     f = cell.font or Font()
-                    cell.font = Font(name="Calibri", size=11, bold=f.bold, italic=f.italic, color=f.color)
+                    cell.font = Font(name="Calibri", size=11,
+                                     bold=f.bold, italic=f.italic, color=f.color)
 
             # Left-align all cells
             left_align = Alignment(horizontal="left")
