@@ -2,7 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { Truck, Package, Scale, AlertTriangle, CheckSquare, Square, MapPin } from 'lucide-react';
 import { TruckSummary, OrderAssignment, WeightConfig } from '../types';
 
-interface RouteManagementProps {
+interface TruckCombinationProps {
     trucks: TruckSummary[];
     assignments: OrderAssignment[];
     weightConfig: WeightConfig;
@@ -26,7 +26,7 @@ interface SelectedLine {
     assignment: OrderAssignment;
 }
 
-const RouteManagement: React.FC<RouteManagementProps> = ({
+const TruckCombination: React.FC<TruckCombinationProps> = ({
     trucks,
     assignments,
     weightConfig,
@@ -208,8 +208,8 @@ const RouteManagement: React.FC<RouteManagementProps> = ({
                 <div className="flex justify-between items-center">
                     <div>
                         <h2 className="text-2xl font-bold text-gray-900 flex items-center">
-                            <MapPin className="h-6 w-6 mr-2 text-blue-600" />
-                            Route Management
+                            <Truck className="h-6 w-6 mr-2 text-blue-600" />
+                            Truck Combination
                         </h2>
                         <p className="text-gray-600 mt-1">
                             Combine underweight trucks to optimize capacity • {underweightCount} underweight trucks found
@@ -441,5 +441,5 @@ const RouteManagement: React.FC<RouteManagementProps> = ({
     );
 };
 
-export default RouteManagement;
+export default TruckCombination;
 

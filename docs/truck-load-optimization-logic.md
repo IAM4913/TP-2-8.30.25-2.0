@@ -1,6 +1,6 @@
-# Truck Routing Logic (Backend v0.1.0)
+# Truck Load Optimization Logic (Backend v0.1.0)
 
-This document explains, in detail, how the backend builds trucks (“routing”) from an uploaded Excel file. It reflects the code paths currently used by the API (notably `backend/app/optimizer_simple.py`, plus helpers in `excel_utils.py` and FastAPI endpoints in `main.py`).
+This document explains, in detail, how the backend builds trucks (load optimization and assignment) from an uploaded Excel file. It reflects the code paths currently used by the API (notably `backend/app/optimizer_simple.py`, plus helpers in `excel_utils.py` and FastAPI endpoints in `main.py`).
 
 If you want stricter or different rules, see the “Next steps and toggles” section at the end.
 

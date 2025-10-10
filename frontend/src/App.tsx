@@ -1,11 +1,11 @@
 
 import { useState } from 'react';
 import { Routes, Route, useNavigate, useLocation } from 'react-router-dom';
-import { Truck, Upload, Settings, MapPin as RouteIcon, BarChart3 } from 'lucide-react';
+import { Truck, Upload, Settings, Combine, BarChart3 } from 'lucide-react';
 import FileUpload from './components/FileUpload';
 import Dashboard from './components/Dashboard';
 import TruckResults from './components/TruckResults';
-import RouteManagement from './components/RouteManagement';
+import TruckCombination from './components/TruckCombination';
 import { OptimizeResponse, WeightConfig, CombineTrucksRequest } from './types';
 import { combineTrucks } from './api';
 
@@ -198,14 +198,14 @@ function App() {
                                         Results
                                     </button>
                                     <button
-                                        onClick={() => navigate('/routes')}
-                                        className={`flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors ${location.pathname === '/routes'
+                                        onClick={() => navigate('/combination')}
+                                        className={`flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors ${location.pathname === '/combination'
                                             ? 'bg-blue-100 text-blue-700'
                                             : 'text-gray-700 hover:text-gray-900 hover:bg-gray-100'
                                             }`}
                                     >
-                                        <RouteIcon className="h-4 w-4 mr-1" />
-                                        Route Management
+                                        <Combine className="h-4 w-4 mr-1" />
+                                        Truck Combination
                                     </button>
                                 </>
                             )}
@@ -272,10 +272,10 @@ function App() {
                         }
                     />
                     <Route
-                        path="/routes"
+                        path="/combination"
                         element={
                             optimizeResults ? (
-                                <RouteManagement
+                                <TruckCombination
                                     trucks={optimizeResults.trucks}
                                     assignments={optimizeResults.assignments}
                                     weightConfig={weightConfig}
@@ -283,8 +283,8 @@ function App() {
                                 />
                             ) : (
                                 <div className="text-center py-12">
-                                    <RouteIcon className="h-16 w-16 text-gray-400 mx-auto mb-4" />
-                                    <p className="text-gray-600">No optimization results available for route management.</p>
+                                    <Combine className="h-16 w-16 text-gray-400 mx-auto mb-4" />
+                                    <p className="text-gray-600">No optimization results available for truck combination.</p>
                                     <p className="text-gray-500 text-sm mt-2">Please upload a file and run optimization first.</p>
                                     <button
                                         onClick={() => navigate('/')}
