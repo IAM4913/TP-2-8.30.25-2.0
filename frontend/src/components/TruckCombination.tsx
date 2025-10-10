@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { Truck, Package, Scale, AlertTriangle, CheckSquare, Square, MapPin } from 'lucide-react';
+import { Truck, Package, Scale, AlertTriangle, CheckSquare, Square } from 'lucide-react';
 import { TruckSummary, OrderAssignment, WeightConfig } from '../types';
 
 interface TruckCombinationProps {
