@@ -109,6 +109,7 @@ def solve_vrp(
     max_weight_per_truck: float = 52000,
     max_drive_time_minutes: float = 720,
     service_time_per_stop_minutes: float = 30,
+    max_vehicles: int = 50,
 ) -> List[Route]:
     """
     Solve the Vehicle Routing Problem using Google OR-Tools.
@@ -129,6 +130,7 @@ def solve_vrp(
         max_weight_per_truck: Maximum weight per vehicle
         max_drive_time_minutes: Maximum drive time per vehicle
         service_time_per_stop_minutes: Service time at each stop
+        max_vehicles: Maximum number of vehicles to use (default: 50)
 
     Returns:
         List of optimized routes
@@ -143,7 +145,8 @@ def solve_vrp(
         duration_matrix=duration_matrix,
         max_weight_per_truck=max_weight_per_truck,
         max_drive_time_minutes=max_drive_time_minutes,
-        num_vehicles=min(50, len(stops)),  # Max vehicles = number of stops
+        # Cap at max_vehicles or number of stops
+        num_vehicles=min(max_vehicles, len(stops)),
     )
 
     # Create routing index manager
@@ -241,11 +244,11 @@ def solve_vrp(
     # ============ EXTRACT ROUTES ============
     routes = []
     dropped_nodes = []
+    truck_counter = 1  # Sequential truck numbering
 
     for vehicle_id in range(data['num_vehicles']):
         index = routing.Start(vehicle_id)
         route_stops = []
-        route_stop_indices = []
         route_distance = 0
         route_time = 0
         route_weight = 0
@@ -259,7 +262,6 @@ def solve_vrp(
                 stop_idx = node_index - 1  # Adjust for depot at index 0
                 if 0 <= stop_idx < len(stops):
                     route_stops.append(stops[stop_idx])
-                    route_stop_indices.append(stop_idx)
                     route_weight += stops[stop_idx].weight
                     route_pieces += stops[stop_idx].pieces
 
@@ -279,15 +281,19 @@ def solve_vrp(
             # Add service time
             route_time += len(route_stops) * service_time_per_stop_minutes
 
+            # Create sequence indices (just sequential order for this route's stops)
+            route_stop_sequence = list(range(len(route_stops)))
+
             routes.append(Route(
-                truck_id=vehicle_id + 1,
+                truck_id=truck_counter,  # Use sequential counter instead of vehicle_id
                 stops=route_stops,
-                stop_sequence=route_stop_indices,
+                stop_sequence=route_stop_sequence,
                 total_distance_miles=round(route_distance, 2),
                 total_duration_minutes=round(route_time, 2),
                 total_weight=route_weight,
                 total_pieces=route_pieces,
             ))
+            truck_counter += 1  # Increment for next truck
 
     # Check for dropped nodes
     for node in range(1, manager.GetNumberOfNodes()):
@@ -301,4 +307,3 @@ def solve_vrp(
     print(f"[OR-Tools] Generated {len(routes)} routes")
 
     return routes
-

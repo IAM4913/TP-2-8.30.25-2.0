@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { MapPin, Upload, CheckCircle2, AlertTriangle, Loader2, Navigation, Calculator, Truck as RouteIcon, TrendingUp } from 'lucide-react';
+import { MapPin, Upload, CheckCircle2, AlertTriangle, Loader2, Navigation, Calculator, Truck as RouteIcon, TrendingUp, Settings } from 'lucide-react';
 import { geocodeValidate, getDepot, saveDepot, distanceMatrix, optimizeRoutesPhase2 } from '../api';
 import RouteMap from './RouteMap';
 
@@ -42,10 +42,16 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
     const [file, setFile] = useState<File | null>(sharedFile || null);
     const [isDragging, setIsDragging] = useState(false);
 
+    // Planning Warehouse filter state
+    const [planningWhse, setPlanningWhse] = useState<string>(() => {
+        return localStorage.getItem('planningWhse') || 'ALL';
+    });
+
     // Address validation state
     const [validating, setValidating] = useState(false);
     const [addresses, setAddresses] = useState<Address[]>([]);
     const [addressCount, setAddressCount] = useState(0);
+    const [cacheStats, setCacheStats] = useState<{ cache_hits: number; api_calls: number; failures: number } | null>(null);
 
     // Depot state
     const [depot, setDepot] = useState<Depot | null>(null);
@@ -65,21 +71,27 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
     const [maxStopsPerTruck, setMaxStopsPerTruck] = useState(20);
     const [maxDriveTimeMinutes, setMaxDriveTimeMinutes] = useState(720); // 12 hours
     const [serviceTimePerStopMinutes, setServiceTimePerStopMinutes] = useState(30); // 30 min
+    const [maxTrucks, setMaxTrucks] = useState(50); // Max vehicles to use
 
     // Validate addresses function - defined before useEffect that uses it
     const validateAddresses = useCallback(async (fileToValidate: File) => {
         setValidating(true);
         try {
-            const planningWhse = localStorage.getItem('planningWhse') || 'ZAC';
-            const result = await geocodeValidate(fileToValidate, { planningWhse });
+            const whse = planningWhse || 'ALL';
+            const result = await geocodeValidate(fileToValidate, { planningWhse: whse });
             setAddresses(result.addresses || []);
             setAddressCount(result.count || 0);
+            setCacheStats({
+                cache_hits: result.cache_hits || 0,
+                api_calls: result.api_calls || 0,
+                failures: result.failures || 0,
+            });
         } catch (error: any) {
             alert(`Failed to validate addresses: ${error?.response?.data?.detail || error?.message}`);
         } finally {
             setValidating(false);
         }
-    }, []);
+    }, [planningWhse]);
 
     // Load depot on mount
     useEffect(() => {
@@ -190,13 +202,14 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
 
         setOptimizingRoutes(true);
         try {
-            const planningWhse = localStorage.getItem('planningWhse') || 'ZAC';
+            const whse = planningWhse || 'ALL';
             const result = await optimizeRoutesPhase2(file, {
-                planningWhse,
+                planningWhse: whse,
                 maxWeightPerTruck,
                 maxStopsPerTruck,
                 maxDriveTimeMinutes,
                 serviceTimePerStopMinutes,
+                maxTrucks,
             });
             setOptimizedRoutes(result);
         } catch (error: any) {
@@ -226,6 +239,44 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
                 <p className="text-blue-200 text-sm mt-2">
                     This is an independent program - not connected to the truck optimizer.
                 </p>
+            </div>
+
+            {/* Planning Warehouse Filter */}
+            <div className="bg-white rounded-lg shadow p-6">
+                <div className="flex items-center mb-4">
+                    <Settings className="h-5 w-5 text-gray-500 mr-2" />
+                    <h3 className="text-lg font-semibold text-gray-900">Planning Warehouse Filter</h3>
+                </div>
+                <div className="flex items-center gap-4">
+                    <div className="flex-1 max-w-md">
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Filter by Planning Whse (or use "ALL" for all warehouses)
+                        </label>
+                        <input
+                            type="text"
+                            value={planningWhse}
+                            onChange={(e) => {
+                                const value = e.target.value.toUpperCase();
+                                setPlanningWhse(value);
+                                localStorage.setItem('planningWhse', value);
+                            }}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            placeholder="e.g., ZAC, MAR, 28, or ALL"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                            Current filter: <span className="font-semibold">{planningWhse || 'ALL'}</span>
+                        </p>
+                    </div>
+                    {file && (
+                        <button
+                            onClick={() => validateAddresses(file)}
+                            disabled={validating}
+                            className="mt-6 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                        >
+                            {validating ? 'Refreshing...' : 'Refresh Addresses'}
+                        </button>
+                    )}
+                </div>
             </div>
 
             {/* File Upload Section */}
@@ -314,7 +365,7 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
                         {!validating && addresses.length > 0 && (
                             <>
                                 {/* Stats */}
-                                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
                                     <div className="bg-gray-50 p-4 rounded-lg">
                                         <div className="text-sm text-gray-600">Total Addresses</div>
                                         <div className="text-2xl font-semibold">{addressCount}</div>
@@ -338,6 +389,29 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
                                         <div className="text-2xl font-semibold text-red-800">{invalidCount}</div>
                                     </div>
                                 </div>
+
+                                {/* Cache Stats */}
+                                {cacheStats && (
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                                        <div className="bg-blue-50 p-4 rounded-lg border border-blue-200">
+                                            <div className="text-sm text-blue-700 font-medium">From Cache</div>
+                                            <div className="text-2xl font-semibold text-blue-900">{cacheStats.cache_hits}</div>
+                                            <div className="text-xs text-blue-600 mt-1">No API calls needed</div>
+                                        </div>
+                                        <div className="bg-purple-50 p-4 rounded-lg border border-purple-200">
+                                            <div className="text-sm text-purple-700 font-medium">New Geocodes</div>
+                                            <div className="text-2xl font-semibold text-purple-900">{cacheStats.api_calls}</div>
+                                            <div className="text-xs text-purple-600 mt-1">Google API calls</div>
+                                        </div>
+                                        {cacheStats.failures > 0 && (
+                                            <div className="bg-red-50 p-4 rounded-lg border border-red-200">
+                                                <div className="text-sm text-red-700 font-medium">Failed</div>
+                                                <div className="text-2xl font-semibold text-red-900">{cacheStats.failures}</div>
+                                                <div className="text-xs text-red-600 mt-1">Geocoding errors</div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
 
                                 {/* Address Table */}
                                 <div className="overflow-x-auto">
@@ -623,6 +697,16 @@ const RoutingPhase1 = ({ sharedFile }: RoutingPhase1Props): JSX.Element => {
                                         onChange={(e) => setServiceTimePerStopMinutes(parseInt(e.target.value) || 30)}
                                         className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                                     />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-1">Max Trucks</label>
+                                    <input
+                                        type="number"
+                                        value={maxTrucks}
+                                        onChange={(e) => setMaxTrucks(parseInt(e.target.value) || 50)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    />
+                                    <p className="text-xs text-gray-500 mt-1">Maximum vehicles available for routing (default: 50)</p>
                                 </div>
                             </div>
 

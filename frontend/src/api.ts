@@ -6,8 +6,8 @@ import { UploadPreviewResponse, OptimizeResponse, CombineTrucksRequest, CombineT
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
 const api = axios.create({
     baseURL: apiBaseUrl,
-    // Large Excel previews can take time; allow up to 3 minutes
-    timeout: 180000,
+    // Large datasets can take time; allow up to 5 minutes by default
+    timeout: 300000,
 });
 
 export const uploadPreview = async (file: File): Promise<UploadPreviewResponse> => {
@@ -71,12 +71,13 @@ export const routePlan = async (
     return response.data;
 };
 
-export const geocodeValidate = async (file: File, opts?: { planningWhse?: string }): Promise<{ count: number; addresses: any[] }> => {
+export const geocodeValidate = async (file: File, opts?: { planningWhse?: string }): Promise<{ count: number; addresses: any[]; cache_hits: number; api_calls: number; failures: number }> => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('planningWhse', opts?.planningWhse || 'ZAC');
     const response = await api.post('/geocode/validate', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 600000, // 10 minutes for geocoding (can be many addresses)
     });
     return response.data;
 };
@@ -159,7 +160,10 @@ export const distanceMatrix = async (
     const form = new FormData();
     form.append('origins', fmt(origins));
     form.append('destinations', fmt(destinations));
-    const res = await api.post('/distance-matrix', form, { headers: { 'Content-Type': 'multipart/form-data' } });
+    const res = await api.post('/distance-matrix', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 600000, // 10 minutes for large distance matrices
+    });
     return res.data;
 };
 
@@ -172,6 +176,7 @@ export const optimizeRoutesPhase2 = async (
         maxStopsPerTruck?: number;
         maxDriveTimeMinutes?: number;
         serviceTimePerStopMinutes?: number;
+        maxTrucks?: number;
     }
 ): Promise<any> => {
     const formData = new FormData();
@@ -181,9 +186,11 @@ export const optimizeRoutesPhase2 = async (
     if (opts?.maxStopsPerTruck) formData.append('maxStopsPerTruck', String(opts.maxStopsPerTruck));
     if (opts?.maxDriveTimeMinutes) formData.append('maxDriveTimeMinutes', String(opts.maxDriveTimeMinutes));
     if (opts?.serviceTimePerStopMinutes) formData.append('serviceTimePerStopMinutes', String(opts.serviceTimePerStopMinutes));
+    if (opts?.maxTrucks) formData.append('maxTrucks', String(opts.maxTrucks));
 
     const response = await api.post('/route/optimize-phase2', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 600000, // 10 minutes for optimization (geocoding + distance matrix + VRP)
     });
     return response.data;
 };

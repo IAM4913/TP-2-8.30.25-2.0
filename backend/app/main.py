@@ -370,6 +370,7 @@ async def geocode_validate(
     """Phase 1: extract addresses, geocode via Google if key present, and cache results.
 
     If GOOGLE_MAPS_API_KEY is not configured, returns detected addresses without lat/lng.
+    Set planningWhse to empty string, "ALL", or "*" to process all warehouses.
     """
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(
@@ -382,22 +383,69 @@ async def geocode_validate(
         raise HTTPException(
             status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
-    if planningWhse:
+    # Filter by Planning Whse unless explicitly set to "all" or empty
+    if planningWhse and planningWhse.upper() not in ("ALL", "*", ""):
         try:
             df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
         except Exception:
             pass
     df = compute_calculated_fields(df)
 
+    # Filter out rows with RPcs <= 0 before extracting addresses
+    if "RPcs" in df.columns:
+        initial_count = len(df)
+        df = df[df["RPcs"] > 0].copy()
+        filtered_count = len(df)
+        print(
+            f"[geocode-validate] Filtered {initial_count - filtered_count} rows with RPcs <= 0 (keeping {filtered_count} rows)")
+
     addrs = extract_unique_addresses(df)
 
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
     dsn = _build_supabase_dsn()
+
+    # BATCH CACHE LOOKUP - single query for all addresses
+    cache_map: Dict[str, Dict[str, Any]] = {}
+    if dsn:
+        try:
+            normalized_addrs = [a.get("normalized") or "" for a in addrs]
+            with psycopg.connect(dsn, connect_timeout=30) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        select normalized, latitude, longitude, confidence, provider
+                        from address_cache
+                        where normalized = ANY(%s)
+                        """,
+                        (normalized_addrs,),
+                    )
+                    for row in cur.fetchall():
+                        cache_map[row[0]] = {
+                            "latitude": row[1],
+                            "longitude": row[2],
+                            "confidence": row[3],
+                            "provider": row[4],
+                        }
+            print(
+                f"[geocode-validate] Batch cache lookup: {len(cache_map)} hits out of {len(addrs)} addresses")
+        except Exception as exc:
+            print(f"[geocode-validate] Batch cache lookup failed: {exc}")
+
+    # Separate cached from uncached addresses
     enriched: List[Dict[str, Any]] = []
+    cache_hits = 0
+    api_calls = 0
+    failures = 0
+    new_geocodes = []  # For batch cache write
+
+    # First pass: handle cache hits and identify cache misses
+    cache_misses = []
     for a in addrs:
-        item: Dict[str, Any] = dict(a)
-        cached = cache_lookup_address(dsn, a.get("normalized") or "")
-        if cached:
+        normalized = a.get("normalized") or ""
+        if normalized in cache_map:
+            # Cache hit
+            cached = cache_map[normalized]
+            item = dict(a)
             item.update({
                 "latitude": cached.get("latitude"),
                 "longitude": cached.get("longitude"),
@@ -405,27 +453,105 @@ async def geocode_validate(
                 "provider": cached.get("provider"),
                 "source": "cache",
             })
-        elif api_key:
+            enriched.append(item)
+            cache_hits += 1
+        else:
+            cache_misses.append(a)
+
+    # Parallel geocoding for cache misses
+    if cache_misses and api_key:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def geocode_one(addr):
+            """Geocode a single address and return result."""
             try:
-                q = build_address_query(a)
+                q = build_address_query(addr)
                 lat, lng, conf, provider, _fmt = google_geocode_query(
                     q, api_key)
-                item.update({
-                    "latitude": lat,
-                    "longitude": lng,
-                    "confidence": conf,
-                    "provider": provider,
-                    "source": "google",
-                })
-                cache_upsert_address(dsn, a.get(
-                    "normalized") or "", a, lat, lng, conf, provider)
-            except Exception as _exc:
-                item.update({"error": "GEOCODE_FAILED"})
-        else:
-            item.update({"note": "No API key configured"})
-        enriched.append(item)
+                return (addr, lat, lng, conf, provider, None)
+            except Exception as exc:
+                return (addr, None, None, None, None, str(exc))
 
-    return {"count": len(enriched), "addresses": enriched}
+        print(
+            f"[geocode-validate] Geocoding {len(cache_misses)} addresses in parallel (max 10 concurrent)...")
+
+        # Use ThreadPoolExecutor for parallel API calls (max 10 concurrent to be nice to API)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_addr = {executor.submit(
+                geocode_one, a): a for a in cache_misses}
+
+            for future in as_completed(future_to_addr):
+                addr, lat, lng, conf, provider, error = future.result()
+                item = dict(addr)
+                normalized = addr.get("normalized") or ""
+
+                if error:
+                    item.update({"error": "GEOCODE_FAILED"})
+                    failures += 1
+                else:
+                    item.update({
+                        "latitude": lat,
+                        "longitude": lng,
+                        "confidence": conf,
+                        "provider": provider,
+                        "source": "google",
+                    })
+                    new_geocodes.append(
+                        (normalized, addr, lat, lng, conf, provider))
+                    api_calls += 1
+
+                enriched.append(item)
+    elif cache_misses and not api_key:
+        # No API key configured
+        for a in cache_misses:
+            item = dict(a)
+            item.update({"note": "No API key configured"})
+            enriched.append(item)
+
+    # BATCH CACHE WRITE - single transaction for all new geocodes
+    if dsn and new_geocodes:
+        try:
+            with psycopg.connect(dsn, connect_timeout=30) as conn:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        insert into address_cache (normalized, street, suite, city, state, zip, latitude, longitude, confidence, provider)
+                        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        on conflict (normalized)
+                        do update set street=excluded.street, suite=excluded.suite, city=excluded.city,
+                                      state=excluded.state, zip=excluded.zip, latitude=excluded.latitude,
+                                      longitude=excluded.longitude, confidence=excluded.confidence,
+                                      provider=excluded.provider, updated_at=now()
+                        """,
+                        [
+                            (
+                                normalized,
+                                parts.get("street"),
+                                parts.get("suite"),
+                                parts.get("city"),
+                                parts.get("state"),
+                                parts.get("zip"),
+                                lat,
+                                lng,
+                                conf,
+                                provider,
+                            )
+                            for normalized, parts, lat, lng, conf, provider in new_geocodes
+                        ],
+                    )
+                conn.commit()
+            print(
+                f"[geocode-validate] Batch cache write: {len(new_geocodes)} new geocodes")
+        except Exception as exc:
+            print(f"[geocode-validate] Batch cache write failed: {exc}")
+
+    return {
+        "count": len(enriched),
+        "addresses": enriched,
+        "cache_hits": cache_hits,
+        "api_calls": api_calls,
+        "failures": failures,
+    }
 
 
 @app.post("/distance-matrix")
@@ -672,6 +798,7 @@ async def route_optimize_phase2(
     maxStopsPerTruck: Optional[int] = Form(20),
     maxDriveTimeMinutes: Optional[int] = Form(720),  # 12 hours default
     serviceTimePerStopMinutes: Optional[int] = Form(30),  # 30 min per stop
+    maxTrucks: Optional[int] = Form(50),  # Max vehicles to use
 ) -> Dict[str, Any]:
     """Phase 2: Geographic clustering + TSP route optimization.
 
@@ -697,6 +824,14 @@ async def route_optimize_phase2(
             pass
 
     df = compute_calculated_fields(df)
+
+    # Filter out rows with RPcs <= 0 before extracting addresses
+    if "RPcs" in df.columns:
+        initial_count = len(df)
+        df = df[df["RPcs"] > 0].copy()
+        filtered_count = len(df)
+        print(
+            f"[route-optimize] Filtered {initial_count - filtered_count} rows with RPcs <= 0 (keeping {filtered_count} rows)")
 
     # Extract and geocode addresses
     addrs = extract_unique_addresses(df)
@@ -740,19 +875,160 @@ async def route_optimize_phase2(
     depot_lng = depot.get("longitude") if depot.get(
         "longitude") else -97.281410
 
-    # Build distance matrix (depot + all geocoded addresses)
+    # Build distance matrix (depot + all geocoded addresses) WITH CACHING
     coords = [(depot_lat, depot_lng)] + [(a["latitude"], a["longitude"])
                                          for a in geocoded_addrs]
 
-    # Try Google Distance Matrix, fallback to Haversine
-    try:
-        if api_key:
-            dist_matrix, dur_matrix = google_distance_matrix(
-                api_key, coords, coords)
+    # Initialize result matrices
+    n = len(coords)
+    dist_matrix = [[0.0] * n for _ in range(n)]
+    dur_matrix = [[0.0] * n for _ in range(n)]
+
+    # Check cache for all pairs in a single batch query (much faster!)
+    cache_misses = []
+    provider = "cached"
+
+    if dsn:
+        # Build all coordinate keys
+        coord_keys = [
+            f"{coords[i][0]:.6f},{coords[i][1]:.6f}" for i in range(n)]
+
+        # Build list of all pairs we need
+        all_pairs = []
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    all_pairs.append((i, j, coord_keys[i], coord_keys[j]))
+
+        try:
+            # Single batch query for all cache lookups
+            with psycopg.connect(dsn, connect_timeout=30) as conn:
+                with conn.cursor() as cur:
+                    # Use unnest to query all pairs at once
+                    pairs_tuples = [(orig, dest)
+                                    for _, _, orig, dest in all_pairs]
+
+                    cur.execute(
+                        """
+                        select origin_normalized, dest_normalized, distance_miles, duration_minutes
+                        from distance_cache
+                        where (origin_normalized, dest_normalized) = ANY(%s)
+                        and provider = 'google'
+                        """,
+                        (pairs_tuples,),
+                    )
+
+                    # Build cache hit map
+                    cache_hits = {}
+                    for row in cur.fetchall():
+                        key = (row[0], row[1])  # (origin, dest)
+                        cache_hits[key] = (float(row[2]), float(
+                            row[3]))  # (distance, duration)
+
+                    print(
+                        f"[route-optimize] Found {len(cache_hits)} cached pairs out of {len(all_pairs)}")
+
+                    # Fill in matrix from cache and track misses
+                    for i, j, orig_key, dest_key in all_pairs:
+                        key = (orig_key, dest_key)
+                        if key in cache_hits:
+                            dist_matrix[i][j] = cache_hits[key][0]
+                            dur_matrix[i][j] = cache_hits[key][1]
+                        else:
+                            cache_misses.append((i, j))
+        except Exception as exc:
+            print(
+                f"[route-optimize] Batch cache lookup failed: {exc}, treating all as cache misses")
+            cache_misses = [(i, j) for i, j, _, _ in all_pairs]
+    else:
+        # No DB connection, all are cache misses
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    cache_misses.append((i, j))
+
+    # Fetch missing pairs from Google API or fallback to Haversine
+    if cache_misses and api_key:
+        print(
+            f"[route-optimize] Cache misses: {len(cache_misses)} out of {n*n} pairs")
+
+        # For large matrices (>100 addresses), Google API is too slow/expensive
+        # Use Haversine as fallback for first run, then cache for future runs
+        if n > 100:
+            print(
+                f"[route-optimize] Large dataset ({n} addresses), using Haversine distance approximation")
+            print("[route-optimize] Results will be cached for future use")
+            haversine_dist, haversine_dur = haversine_matrix(coords)
+            for i, j in cache_misses:
+                dist_matrix[i][j] = haversine_dist[i][j]
+                dur_matrix[i][j] = haversine_dur[i][j]
+            provider = "haversine"
         else:
-            dist_matrix, dur_matrix = haversine_matrix(coords)
-    except Exception:
-        dist_matrix, dur_matrix = haversine_matrix(coords)
+            try:
+                # For smaller datasets, use Google API
+                if len(cache_misses) > n * n * 0.5:
+                    # Most are misses, compute full matrix
+                    full_dist, full_dur = google_distance_matrix(
+                        api_key, coords, coords)
+                    for i in range(n):
+                        for j in range(n):
+                            dist_matrix[i][j] = full_dist[i][j]
+                            dur_matrix[i][j] = full_dur[i][j]
+                else:
+                    # Compute individual pairs (fewer misses)
+                    for i, j in cache_misses:
+                        pair_dist, pair_dur = google_distance_matrix(
+                            api_key, [coords[i]], [coords[j]])
+                        dist_matrix[i][j] = pair_dist[0][0]
+                        dur_matrix[i][j] = pair_dur[0][0]
+
+                provider = "google"
+            except Exception as gexc:
+                print(
+                    f"[route-optimize] Google failed; falling back to Haversine: {gexc}")
+                haversine_dist, haversine_dur = haversine_matrix(coords)
+                for i, j in cache_misses:
+                    dist_matrix[i][j] = haversine_dist[i][j]
+                    dur_matrix[i][j] = haversine_dur[i][j]
+                provider = "haversine"
+
+        # Write to cache in batch
+        if dsn and cache_misses:
+            try:
+                with psycopg.connect(dsn, connect_timeout=30) as conn:
+                    with conn.cursor() as cur:
+                        # Batch insert using executemany
+                        cache_data = []
+                        for i, j in cache_misses:
+                            orig_key = f"{coords[i][0]:.6f},{coords[i][1]:.6f}"
+                            dest_key = f"{coords[j][0]:.6f},{coords[j][1]:.6f}"
+                            cache_data.append((
+                                orig_key, dest_key, provider,
+                                dist_matrix[i][j], dur_matrix[i][j]
+                            ))
+
+                        cur.executemany(
+                            """insert into distance_cache (origin_normalized, dest_normalized, provider, distance_miles, duration_minutes)
+                               values (%s,%s,%s,%s,%s)
+                               on conflict (origin_normalized, dest_normalized, provider)
+                               do update set distance_miles = excluded.distance_miles, 
+                                           duration_minutes = excluded.duration_minutes""",
+                            cache_data
+                        )
+                    conn.commit()
+                    print(
+                        f"[route-optimize] Cached {len(cache_misses)} new distance calculations")
+            except Exception as exc:
+                print(f"[route-optimize] Cache write failed: {exc}")
+
+    elif cache_misses and not api_key:
+        # No API key, use Haversine for all misses
+        haversine_dist, haversine_dur = haversine_matrix(coords)
+        for i, j in cache_misses:
+            dist_matrix[i][j] = haversine_dist[i][j]
+            dur_matrix[i][j] = haversine_dur[i][j]
+    else:
+        print(f"[route-optimize] All {n*n} pairs loaded from cache!")
 
     # Create Stop objects for route optimization
     stops: List[Stop] = []
@@ -801,6 +1077,7 @@ async def route_optimize_phase2(
         max_weight_per_truck=float(maxWeightPerTruck or 52000),
         max_drive_time_minutes=float(maxDriveTimeMinutes or 720),
         service_time_per_stop_minutes=float(serviceTimePerStopMinutes or 30),
+        max_vehicles=int(maxTrucks or 50),
     )
 
     return {
