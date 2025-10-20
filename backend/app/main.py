@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, cast
+import json
 import datetime as _dt
 import pandas as pd
 from io import BytesIO
@@ -1039,6 +1040,146 @@ def _presplit_overweight(sites: List[Dict[str, Any]], legs: Dict[str, Dict[str, 
                             "total_pieces": int(res_pcs), "lines": remaining_lines})
 
     return trucks, residual, next_id
+
+
+# ---- Stepwise endpoints for debugging/visibility ----
+
+@app.post("/route/v1/prepare")
+async def route_v1_prepare(
+    file: UploadFile = File(...),
+    planningWhse: Optional[str] = Form("ZAC"),
+) -> Dict[str, Any]:
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
+    try:
+        content: bytes = await file.read()
+        df: pd.DataFrame = pd.read_excel(BytesIO(content), engine="openpyxl")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
+    df = compute_calculated_fields(df)
+    df = apply_routing_filters(df)
+
+    sites = _aggregate_sites(df)
+    _geocode_sites(sites)
+    depot = depot_get()
+    return {"sites": sites, "depot": depot, "count": len(sites)}
+
+
+@app.post("/route/v1/matrix")
+async def route_v1_matrix(
+    sites_json: str = Form(...),
+) -> Dict[str, Any]:
+    try:
+        sites: List[Dict[str, Any]] = json.loads(sites_json)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid sites JSON: {exc}")
+    depot = depot_get()
+    depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
+    depot_lng = depot.get("longitude") if depot.get("longitude") else -97.281410
+    legs = _compute_depot_legs(depot_lat, depot_lng, sites)
+    out: List[Dict[str, Any]] = [{"site_id": sid, **vals} for sid, vals in legs.items()]
+    return {"depot": {"latitude": depot_lat, "longitude": depot_lng}, "depot_legs": out}
+
+
+@app.post("/route/v1/allocate-overweight")
+async def route_v1_allocate_overweight(
+    sites_json: str = Form(...),
+    maxWeightPerTruck: Optional[int] = Form(52000),
+) -> Dict[str, Any]:
+    try:
+        sites: List[Dict[str, Any]] = json.loads(sites_json)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid sites JSON: {exc}")
+    depot = depot_get()
+    depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
+    depot_lng = depot.get("longitude") if depot.get("longitude") else -97.281410
+    legs = _compute_depot_legs(depot_lat, depot_lng, sites)
+    capacity = float(maxWeightPerTruck or 52000)
+    trucks, residual, _ = _presplit_overweight(sites, legs, capacity, starting_truck_id=1)
+    return {
+        "single_stop_trucks": [t.model_dump() for t in trucks],
+        "residual_sites": residual,
+        "depot": {"latitude": depot_lat, "longitude": depot_lng},
+    }
+
+
+@app.post("/route/v1/optimize-remainder")
+async def route_v1_optimize_remainder(
+    residual_json: str = Form(...),
+    serviceTimePerStopMinutes: Optional[int] = Form(30),
+    maxWeightPerTruck: Optional[int] = Form(52000),
+    maxTrucks: Optional[int] = Form(50),
+) -> Dict[str, Any]:
+    try:
+        residual_sites: List[Dict[str, Any]] = json.loads(residual_json)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid residual JSON: {exc}")
+
+    depot = depot_get()
+    depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
+    depot_lng = depot.get("longitude") if depot.get("longitude") else -97.281410
+
+    routes_vrp: List[Dict[str, Any]] = []
+    if residual_sites:
+        coords = [(depot_lat, depot_lng)] + [
+            (float(s.get("latitude") or 0.0), float(s.get("longitude") or 0.0)) for s in residual_sites
+        ]
+        n = len(coords)
+        dist_matrix = [[0.0] * n for _ in range(n)]
+        dur_matrix = [[0.0] * n for _ in range(n)]
+        api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        try:
+            full_dist, full_dur = google_distance_matrix(api_key, coords, coords)
+            for i in range(n):
+                for j in range(n):
+                    dist_matrix[i][j] = full_dist[i][j]
+                    dur_matrix[i][j] = full_dur[i][j]
+        except Exception:
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    try:
+                        pair_dist, pair_dur = google_distance_matrix(api_key, [coords[i]], [coords[j]])
+                        dist_matrix[i][j] = pair_dist[0][0]
+                        dur_matrix[i][j] = pair_dur[0][0]
+                    except Exception:
+                        pass
+        stops: List[Stop] = []
+        for s in residual_sites:
+            stops.append(Stop(
+                customer_name=str(s.get("customer")),
+                address=f"{s.get('city')}, {s.get('state')}",
+                city=str(s.get("city")),
+                state=str(s.get("state")),
+                latitude=float(s.get("latitude") or 0.0),
+                longitude=float(s.get("longitude") or 0.0),
+                weight=float(s.get("total_weight") or 0.0),
+                pieces=int(s.get("total_pieces") or 0),
+                order_id=str(s.get("site_id")),
+                line_id="site",
+            ))
+        vrp_routes = solve_vrp(
+            stops=stops,
+            depot_lat=depot_lat,
+            depot_lng=depot_lng,
+            distance_matrix=dist_matrix,
+            duration_matrix=dur_matrix,
+            max_weight_per_truck=float(maxWeightPerTruck or 52000),
+            max_drive_time_minutes=720,
+            service_time_per_stop_minutes=float(serviceTimePerStopMinutes or 30),
+            max_vehicles=int(maxTrucks or 50),
+        )
+        routes_vrp = [r.to_dict() for r in vrp_routes]
+        for r in routes_vrp:
+            r["route_type"] = "vrp"
+    return {"routes": routes_vrp, "depot": {"latitude": depot_lat, "longitude": depot_lng}}
 
 
 @app.post("/route/v1/optimize")
