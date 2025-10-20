@@ -18,6 +18,10 @@ from .schemas import (
     LineAssignment,
     CombineTrucksRequest,
     CombineTrucksResponse,
+    DemandSite,
+    DepotLeg,
+    SingleStopTruck,
+    OptimizeV1Response,
 )
 from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse, extract_unique_addresses, apply_routing_filters
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
@@ -810,6 +814,376 @@ def depot_put(name: Optional[str] = Form(None), address: Optional[str] = Form(No
             "longitude": longitude,
             "note": "not persisted (DB unavailable)",
         }
+
+
+# =========================
+# Phase 2: Overweight pre-split then VRP remainder (weight-only)
+# =========================
+
+def _infer_country_from_state(state: str) -> str:
+    s = str(state or "").strip().upper()
+    MX = {
+        "AGU", "BCN", "BCS", "CAM", "CHP", "CHH", "CH", "CMX", "COA", "COL",
+        "DUR", "GUA", "GRO", "HID", "JAL", "MEX", "MIC", "MOR", "NAY", "NLE",
+        "OAX", "PUE", "QUE", "ROO", "SLP", "SIN", "SON", "TAB", "TAM", "TLA",
+        "VER", "YUC", "ZAC"
+    }
+    return "Mexico" if s in MX else "USA"
+
+
+def _aggregate_sites(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    sites: List[Dict[str, Any]] = []
+    if df.empty:
+        return sites
+
+    # Ensure necessary columns exist
+    required_cols = ["Customer", "shipping_city", "shipping_state",
+                     "RPcs", "Ready Weight"]
+    for c in required_cols:
+        if c not in df.columns:
+            df[c] = None
+
+    # Prepare per-piece weight
+    if "Weight Per Piece" not in df.columns:
+        df["Weight Per Piece"] = pd.to_numeric(
+            df["Ready Weight"], errors="coerce") / df["RPcs"].replace(0, pd.NA)
+
+    # Group by site (customer+city+state+country)
+    tmp = df.copy()
+    tmp["country"] = tmp["shipping_state"].apply(_infer_country_from_state)
+    grp_cols = ["Customer", "shipping_city", "shipping_state", "country"]
+    for (customer, city, state, country), g in tmp.groupby(grp_cols, dropna=False):
+        total_weight = float(pd.to_numeric(
+            g["Ready Weight"], errors="coerce").fillna(0).sum())
+        total_pieces = int(pd.to_numeric(
+            g["RPcs"], errors="coerce").fillna(0).sum())
+        if total_weight <= 0 or total_pieces <= 0:
+            continue
+        site_id = f"{str(customer)}|{str(city)}|{str(state)}|{str(country)}"
+        # capture line-level info used for splitting
+        lines = []
+        for _, r in g.iterrows():
+            rp = int(pd.to_numeric(r.get("RPcs"), errors="coerce") or 0)
+            rw = float(pd.to_numeric(
+                r.get("Ready Weight"), errors="coerce") or 0.0)
+            wpp = r.get("Weight Per Piece")
+            try:
+                wppf = float(wpp) if wpp is not None else (
+                    rw / rp if rp > 0 else 0.0)
+            except Exception:
+                wppf = rw / rp if rp > 0 else 0.0
+            if rp <= 0 or rw <= 0:
+                continue
+            lines.append({
+                "SO": r.get("SO"),
+                "Line": r.get("Line"),
+                "RPcs": int(rp),
+                "ReadyWeight": float(rw),
+                "WeightPerPiece": float(wppf),
+            })
+
+        sites.append({
+            "site_id": site_id,
+            "customer": str(customer),
+            "city": str(city),
+            "state": str(state),
+            "country": str(country),
+            "total_weight": total_weight,
+            "total_pieces": total_pieces,
+            "latitude": None,
+            "longitude": None,
+            "lines": lines,
+        })
+
+    return sites
+
+
+def _geocode_sites(sites: List[Dict[str, Any]]) -> None:
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    dsn = _build_supabase_dsn()
+    for s in sites:
+        if s.get("latitude") and s.get("longitude"):
+            continue
+        # Use city/state/country as query
+        parts = {"city": s.get("city"), "state": s.get(
+            "state"), "country": s.get("country")}
+        normalized = f"{str(parts.get('city') or '').strip().lower()},{str(parts.get('state') or '').strip().upper()},{str(parts.get('country') or '').strip()}"
+        cached = cache_lookup_address(dsn, normalized) if dsn else None
+        if cached and cached.get("latitude") and cached.get("longitude"):
+            s["latitude"] = cached["latitude"]
+            s["longitude"] = cached["longitude"]
+            continue
+        if not api_key:
+            continue
+        try:
+            q = ", ".join(
+                [c for c in [s.get("city"), s.get("state"), s.get("country")] if c])
+            lat, lng, conf, provider, _ = google_geocode_query(q, api_key)
+            s["latitude"], s["longitude"] = float(lat), float(lng)
+            # Upsert into cache under our normalized key
+            if dsn:
+                cache_upsert_address(dsn, normalized, {"city": s.get("city"), "state": s.get(
+                    "state"), "country": s.get("country")}, lat, lng, conf, provider)
+        except Exception:
+            continue
+
+
+def _compute_depot_legs(depot_lat: float, depot_lng: float, sites: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    # Build coords list for destinations
+    dests = []
+    idx_map: List[str] = []
+    for s in sites:
+        if s.get("latitude") and s.get("longitude"):
+            dests.append((float(s["latitude"]), float(s["longitude"])))
+            idx_map.append(s["site_id"])
+    if not dests:
+        return {}
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    dist, dur = google_distance_matrix(
+        api_key, origins=[(depot_lat, depot_lng)], destinations=dests)
+    legs: Dict[str, Dict[str, float]] = {}
+    # dist and dur are lists; first row corresponds to depot
+    for j, site_id in enumerate(idx_map):
+        miles = float(dist[0][j]) if dist and dist[0] else 0.0
+        minutes = float(dur[0][j]) if dur and dur[0] else 0.0
+        legs[site_id] = {"miles_out": miles, "minutes_out": minutes}
+    return legs
+
+
+def _presplit_overweight(sites: List[Dict[str, Any]], legs: Dict[str, Dict[str, float]], capacity: float, starting_truck_id: int = 1) -> (List[SingleStopTruck], List[Dict[str, Any]], int):
+    trucks: List[SingleStopTruck] = []
+    residual: List[Dict[str, Any]] = []
+    next_id = starting_truck_id
+    for s in sites:
+        site_weight = float(s.get("total_weight") or 0.0)
+        pieces_left = int(s.get("total_pieces") or 0)
+        lines = list(s.get("lines") or [])
+        # Sort by heavy pieces first
+        lines = [{**ln} for ln in lines]
+        lines.sort(key=lambda x: float(
+            x.get("WeightPerPiece") or 0.0), reverse=True)
+
+        if site_weight <= capacity + 1e-6:
+            # No pre-split; pass along as residual
+            residual.append(s)
+            continue
+
+        full_trucks = []
+        remaining_weight = site_weight
+        remaining_lines = lines
+
+        while remaining_weight > capacity + 1e-6 and remaining_lines:
+            take_weight = 0.0
+            take_pcs = 0
+            take_lines: List[Dict[str, Any]] = []
+            new_remaining: List[Dict[str, Any]] = []
+            for ln in remaining_lines:
+                pcs = int(ln.get("RPcs") or 0)
+                wpp = float(ln.get("WeightPerPiece") or 0.0)
+                # take as many pieces as fit
+                max_can_take = int((capacity - take_weight) //
+                                   wpp) if wpp > 0 else 0
+                if max_can_take <= 0:
+                    new_remaining.append(ln)
+                    continue
+                take = min(pcs, max_can_take)
+                if take > 0:
+                    take_weight += take * wpp
+                    take_pcs += take
+                    left = pcs - take
+                    if left > 0:
+                        new_remaining.append(
+                            {**ln, "RPcs": left, "ReadyWeight": left * wpp})
+                    # record taken fragment (not stored now)
+                else:
+                    new_remaining.append(ln)
+                if capacity - take_weight < 1e-6:
+                    # truck is effectively full
+                    # remaining lines stay for next trucks
+                    new_remaining.extend(
+                        [l for l in remaining_lines[remaining_lines.index(ln)+1:]])
+                    break
+            # finalize this truck if it has any weight
+            if take_weight > 0:
+                full_trucks.append({"weight": take_weight, "pieces": take_pcs})
+                remaining_weight -= take_weight
+                remaining_lines = new_remaining
+            else:
+                # no progress; break to avoid infinite loop
+                break
+
+        # Emit full single-stop trucks
+        leg = legs.get(s["site_id"], {"miles_out": 0.0, "minutes_out": 0.0})
+        for idx, ft in enumerate(full_trucks, 1):
+            trucks.append(SingleStopTruck(
+                truck_id=next_id,
+                site_id=s["site_id"],
+                customer=s["customer"],
+                city=s["city"],
+                state=s["state"],
+                latitude=float(s.get("latitude") or 0.0),
+                longitude=float(s.get("longitude") or 0.0),
+                weight=float(ft["weight"]),
+                pieces=int(ft["pieces"]),
+                total_distance_miles=float(2 * leg.get("miles_out", 0.0)),
+                total_duration_minutes=float(2 * leg.get("minutes_out", 0.0)),
+            ))
+            next_id += 1
+
+        # Build residual site with remaining_lines aggregated
+        res_weight = sum(float(ln.get("ReadyWeight") or (ln.get(
+            "RPcs", 0) * float(ln.get("WeightPerPiece") or 0.0))) for ln in remaining_lines)
+        res_pcs = sum(int(ln.get("RPcs") or 0) for ln in remaining_lines)
+        if res_weight > 1e-6 and res_pcs > 0:
+            residual.append({**s, "total_weight": float(res_weight),
+                            "total_pieces": int(res_pcs), "lines": remaining_lines})
+
+    return trucks, residual, next_id
+
+
+@app.post("/route/v1/optimize")
+async def route_optimize_v1(
+    file: UploadFile = File(...),
+    planningWhse: Optional[str] = Form("ZAC"),
+    maxWeightPerTruck: Optional[int] = Form(52000),
+    serviceTimePerStopMinutes: Optional[int] = Form(30),
+    maxStopsPerRoute: Optional[int] = Form(20),
+    maxTrucks: Optional[int] = Form(50),
+) -> OptimizeV1Response:
+    # 1) Read + filter + calculated fields
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=400, detail="Only .xlsx files are supported")
+    try:
+        content: bytes = await file.read()
+        df: pd.DataFrame = pd.read_excel(BytesIO(content), engine="openpyxl")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+
+    if planningWhse:
+        try:
+            df = filter_by_planning_whse(df, allowed_values=(planningWhse,))
+        except Exception:
+            pass
+    df = compute_calculated_fields(df)
+    df = apply_routing_filters(df)
+
+    # 2) Aggregate sites
+    sites = _aggregate_sites(df)
+    if not sites:
+        raise HTTPException(status_code=400, detail="No valid sites found")
+
+    # 3) Geocode sites
+    _geocode_sites(sites)
+
+    # 4) Depot
+    depot = depot_get()
+    depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
+    depot_lng = depot.get("longitude") if depot.get(
+        "longitude") else -97.281410
+
+    # 5) Depot legs O(N)
+    legs = _compute_depot_legs(depot_lat, depot_lng, sites)
+
+    # 6) Overweight pre-split (extract only full trucks; remainder stays for VRP)
+    capacity = float(maxWeightPerTruck or 52000)
+    single_trucks, residual_sites, next_truck_id = _presplit_overweight(
+        sites, legs, capacity, starting_truck_id=1)
+
+    # Filter residual to those <= capacity
+    residual_sites = [s for s in residual_sites if float(
+        s.get("total_weight") or 0.0) <= capacity + 1e-6]
+
+    # 7) Build VRP for residual sites
+    routes_vrp: List[Dict[str, Any]] = []
+    if residual_sites:
+        # Build coords including depot as index 0
+        coords = [(depot_lat, depot_lng)] + [
+            (float(s.get("latitude") or 0.0), float(s.get("longitude") or 0.0)) for s in residual_sites
+        ]
+
+        # Build matrices using Google with caching logic similar to phase2
+        n = len(coords)
+        dist_matrix = [[0.0] * n for _ in range(n)]
+        dur_matrix = [[0.0] * n for _ in range(n)]
+
+        api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        dsn = _build_supabase_dsn()
+
+        # For simplicity, fetch full matrix via one call when small; else pair-by-pair
+        try:
+            full_dist, full_dur = google_distance_matrix(
+                api_key, coords, coords)
+            for i in range(n):
+                for j in range(n):
+                    dist_matrix[i][j] = full_dist[i][j]
+                    dur_matrix[i][j] = full_dur[i][j]
+        except Exception as exc:
+            # Fallback: compute pairs
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    try:
+                        pair_dist, pair_dur = google_distance_matrix(
+                            api_key, [coords[i]], [coords[j]])
+                        dist_matrix[i][j] = pair_dist[0][0]
+                        dur_matrix[i][j] = pair_dur[0][0]
+                    except Exception:
+                        dist_matrix[i][j] = 0.0
+                        dur_matrix[i][j] = 0.0
+
+        # Build stops
+        stops: List[Stop] = []
+        for s in residual_sites:
+            stops.append(Stop(
+                customer_name=str(s.get("customer")),
+                address=f"{s.get('city')}, {s.get('state')}",
+                city=str(s.get("city")),
+                state=str(s.get("state")),
+                latitude=float(s.get("latitude") or 0.0),
+                longitude=float(s.get("longitude") or 0.0),
+                weight=float(s.get("total_weight") or 0.0),
+                pieces=int(s.get("total_pieces") or 0),
+                order_id=str(s.get("site_id")),
+                line_id="site",
+            ))
+
+        vrp_routes = solve_vrp(
+            stops=stops,
+            depot_lat=depot_lat,
+            depot_lng=depot_lng,
+            distance_matrix=dist_matrix,
+            duration_matrix=dur_matrix,
+            max_weight_per_truck=capacity,
+            max_drive_time_minutes=720,
+            service_time_per_stop_minutes=float(
+                serviceTimePerStopMinutes or 30),
+            max_vehicles=int(maxTrucks or 50),
+        )
+
+        for r in vrp_routes:
+            rd = r.to_dict()
+            rd["route_type"] = "vrp"
+            routes_vrp.append(rd)
+
+    # 8) Assemble final
+    routes_single = [t.model_dump() for t in single_trucks]
+    all_routes = routes_single + routes_vrp
+    totals = {
+        "trucks": len(all_routes),
+        "stops": sum(len(r.get("stops", [1])) if r.get("route_type") == "vrp" else 1 for r in all_routes),
+        "weight": sum(
+            (r.get("total_weight") or r.get("weight") or 0.0) for r in all_routes
+        ),
+    }
+    diagnostics = {
+        "overweight_sites": len([s for s in sites if float(s.get("total_weight") or 0.0) > capacity + 1e-6]),
+        "residual_sites": len(residual_sites),
+    }
+
+    return OptimizeV1Response(routes=all_routes, depot={"latitude": depot_lat, "longitude": depot_lng, "name": depot.get("name")}, totals=totals, diagnostics=diagnostics)
 
 
 @app.post("/route/optimize-phase2")

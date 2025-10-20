@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+from typing import Optional as _Optional
 
 
 class UploadPreviewResponse(BaseModel):
@@ -106,3 +107,46 @@ class CombineTrucksResponse(BaseModel):
     newTruck: Optional[TruckSummary] = None
     updatedAssignments: List[LineAssignment]
     removedTruckIds: List[int]
+
+
+# ====== Phase 2 weight-first pipeline models ======
+
+class DemandSite(BaseModel):
+    site_id: str
+    customer: str
+    city: str
+    state: str
+    country: str
+    total_weight: float
+    total_pieces: int
+    latitude: _Optional[float] = None
+    longitude: _Optional[float] = None
+    lines: List[Dict[str, Any]] = []
+
+
+class DepotLeg(BaseModel):
+    site_id: str
+    miles_out: float
+    minutes_out: float
+
+
+class SingleStopTruck(BaseModel):
+    truck_id: int
+    route_type: str = Field("single_stop")
+    site_id: str
+    customer: str
+    city: str
+    state: str
+    latitude: float
+    longitude: float
+    weight: float
+    pieces: int
+    total_distance_miles: float
+    total_duration_minutes: float
+
+
+class OptimizeV1Response(BaseModel):
+    routes: List[Dict[str, Any]]
+    depot: Dict[str, Any]
+    totals: Dict[str, Any]
+    diagnostics: Dict[str, Any]

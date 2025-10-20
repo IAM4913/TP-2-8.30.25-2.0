@@ -188,7 +188,7 @@ export const optimizeRoutesPhase2 = async (
     if (opts?.serviceTimePerStopMinutes) formData.append('serviceTimePerStopMinutes', String(opts.serviceTimePerStopMinutes));
     if (opts?.maxTrucks) formData.append('maxTrucks', String(opts.maxTrucks));
 
-    const response = await api.post('/route/optimize-phase2', formData, {
+    const response = await api.post('/route/v1/optimize', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 600000, // 10 minutes for optimization (geocoding + distance matrix + VRP)
     });
