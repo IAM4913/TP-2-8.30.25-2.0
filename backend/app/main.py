@@ -935,19 +935,32 @@ def _compute_depot_legs(depot_lat: float, depot_lng: float, sites: List[Dict[str
     idx_map: List[str] = []
     for s in sites:
         if s.get("latitude") and s.get("longitude"):
-            dests.append((float(s["latitude"]), float(s["longitude"])))
+            dests.append((float(s["latitude"]), float(s["longitude"])) )
             idx_map.append(s["site_id"])
     if not dests:
         return {}
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    dist, dur = google_distance_matrix(
-        api_key, origins=[(depot_lat, depot_lng)], destinations=dests)
     legs: Dict[str, Dict[str, float]] = {}
-    # dist and dur are lists; first row corresponds to depot
-    for j, site_id in enumerate(idx_map):
-        miles = float(dist[0][j]) if dist and dist[0] else 0.0
-        minutes = float(dur[0][j]) if dur and dur[0] else 0.0
-        legs[site_id] = {"miles_out": miles, "minutes_out": minutes}
+    try:
+        if api_key:
+            dist, dur = google_distance_matrix(api_key, origins=[(depot_lat, depot_lng)], destinations=dests)
+            for j, site_id in enumerate(idx_map):
+                miles = float(dist[0][j]) if dist and dist[0] else 0.0
+                minutes = float(dur[0][j]) if dur and dur[0] else 0.0
+                legs[site_id] = {"miles_out": miles, "minutes_out": minutes}
+        else:
+            # Haversine fallback
+            hv_dist, hv_dur = haversine_matrix([(depot_lat, depot_lng)] + dests)
+            for j, site_id in enumerate(idx_map):
+                miles = hv_dist[0][j+1]
+                minutes = hv_dur[0][j+1]
+                legs[site_id] = {"miles_out": miles, "minutes_out": minutes}
+    except Exception:
+        hv_dist, hv_dur = haversine_matrix([(depot_lat, depot_lng)] + dests)
+        for j, site_id in enumerate(idx_map):
+            miles = hv_dist[0][j+1]
+            minutes = hv_dur[0][j+1]
+            legs[site_id] = {"miles_out": miles, "minutes_out": minutes}
     return legs
 
 
@@ -1050,12 +1063,14 @@ async def route_v1_prepare(
     planningWhse: Optional[str] = Form("ZAC"),
 ) -> Dict[str, Any]:
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
+        raise HTTPException(
+            status_code=400, detail="Only .xlsx files are supported")
     try:
         content: bytes = await file.read()
         df: pd.DataFrame = pd.read_excel(BytesIO(content), engine="openpyxl")
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Excel: {exc}") from exc
 
     if planningWhse:
         try:
@@ -1078,12 +1093,15 @@ async def route_v1_matrix(
     try:
         sites: List[Dict[str, Any]] = json.loads(sites_json)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid sites JSON: {exc}")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid sites JSON: {exc}")
     depot = depot_get()
     depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
-    depot_lng = depot.get("longitude") if depot.get("longitude") else -97.281410
+    depot_lng = depot.get("longitude") if depot.get(
+        "longitude") else -97.281410
     legs = _compute_depot_legs(depot_lat, depot_lng, sites)
-    out: List[Dict[str, Any]] = [{"site_id": sid, **vals} for sid, vals in legs.items()]
+    out: List[Dict[str, Any]] = [{"site_id": sid, **vals}
+                                 for sid, vals in legs.items()]
     return {"depot": {"latitude": depot_lat, "longitude": depot_lng}, "depot_legs": out}
 
 
@@ -1095,13 +1113,16 @@ async def route_v1_allocate_overweight(
     try:
         sites: List[Dict[str, Any]] = json.loads(sites_json)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid sites JSON: {exc}")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid sites JSON: {exc}")
     depot = depot_get()
     depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
-    depot_lng = depot.get("longitude") if depot.get("longitude") else -97.281410
+    depot_lng = depot.get("longitude") if depot.get(
+        "longitude") else -97.281410
     legs = _compute_depot_legs(depot_lat, depot_lng, sites)
     capacity = float(maxWeightPerTruck or 52000)
-    trucks, residual, _ = _presplit_overweight(sites, legs, capacity, starting_truck_id=1)
+    trucks, residual, _ = _presplit_overweight(
+        sites, legs, capacity, starting_truck_id=1)
     return {
         "single_stop_trucks": [t.model_dump() for t in trucks],
         "residual_sites": residual,
@@ -1119,11 +1140,13 @@ async def route_v1_optimize_remainder(
     try:
         residual_sites: List[Dict[str, Any]] = json.loads(residual_json)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid residual JSON: {exc}")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid residual JSON: {exc}")
 
     depot = depot_get()
     depot_lat = depot.get("latitude") if depot.get("latitude") else 32.795580
-    depot_lng = depot.get("longitude") if depot.get("longitude") else -97.281410
+    depot_lng = depot.get("longitude") if depot.get(
+        "longitude") else -97.281410
 
     routes_vrp: List[Dict[str, Any]] = []
     if residual_sites:
@@ -1135,7 +1158,8 @@ async def route_v1_optimize_remainder(
         dur_matrix = [[0.0] * n for _ in range(n)]
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         try:
-            full_dist, full_dur = google_distance_matrix(api_key, coords, coords)
+            full_dist, full_dur = google_distance_matrix(
+                api_key, coords, coords)
             for i in range(n):
                 for j in range(n):
                     dist_matrix[i][j] = full_dist[i][j]
@@ -1146,7 +1170,8 @@ async def route_v1_optimize_remainder(
                     if i == j:
                         continue
                     try:
-                        pair_dist, pair_dur = google_distance_matrix(api_key, [coords[i]], [coords[j]])
+                        pair_dist, pair_dur = google_distance_matrix(
+                            api_key, [coords[i]], [coords[j]])
                         dist_matrix[i][j] = pair_dist[0][0]
                         dur_matrix[i][j] = pair_dur[0][0]
                     except Exception:
@@ -1173,7 +1198,8 @@ async def route_v1_optimize_remainder(
             duration_matrix=dur_matrix,
             max_weight_per_truck=float(maxWeightPerTruck or 52000),
             max_drive_time_minutes=720,
-            service_time_per_stop_minutes=float(serviceTimePerStopMinutes or 30),
+            service_time_per_stop_minutes=float(
+                serviceTimePerStopMinutes or 30),
             max_vehicles=int(maxTrucks or 50),
         )
         routes_vrp = [r.to_dict() for r in vrp_routes]
@@ -1250,30 +1276,36 @@ async def route_optimize_v1(
         dur_matrix = [[0.0] * n for _ in range(n)]
 
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-        dsn = _build_supabase_dsn()
-
-        # For simplicity, fetch full matrix via one call when small; else pair-by-pair
-        try:
-            full_dist, full_dur = google_distance_matrix(
-                api_key, coords, coords)
+        if not api_key:
+            hv_dist, hv_dur = haversine_matrix(coords)
             for i in range(n):
                 for j in range(n):
-                    dist_matrix[i][j] = full_dist[i][j]
-                    dur_matrix[i][j] = full_dur[i][j]
-        except Exception as exc:
-            # Fallback: compute pairs
-            for i in range(n):
-                for j in range(n):
-                    if i == j:
-                        continue
-                    try:
-                        pair_dist, pair_dur = google_distance_matrix(
-                            api_key, [coords[i]], [coords[j]])
-                        dist_matrix[i][j] = pair_dist[0][0]
-                        dur_matrix[i][j] = pair_dur[0][0]
-                    except Exception:
-                        dist_matrix[i][j] = 0.0
-                        dur_matrix[i][j] = 0.0
+                    dist_matrix[i][j] = hv_dist[i][j]
+                    dur_matrix[i][j] = hv_dur[i][j]
+        else:
+            try:
+                full_dist, full_dur = google_distance_matrix(
+                    api_key, coords, coords)
+                for i in range(n):
+                    for j in range(n):
+                        dist_matrix[i][j] = full_dist[i][j]
+                        dur_matrix[i][j] = full_dur[i][j]
+            except Exception:
+                try:
+                    for i in range(n):
+                        for j in range(n):
+                            if i == j:
+                                continue
+                            pair_dist, pair_dur = google_distance_matrix(
+                                api_key, [coords[i]], [coords[j]])
+                            dist_matrix[i][j] = pair_dist[0][0]
+                            dur_matrix[i][j] = pair_dur[0][0]
+                except Exception:
+                    hv_dist, hv_dur = haversine_matrix(coords)
+                    for i in range(n):
+                        for j in range(n):
+                            dist_matrix[i][j] = hv_dist[i][j]
+                            dur_matrix[i][j] = hv_dur[i][j]
 
         # Build stops
         stops: List[Stop] = []
@@ -1309,8 +1341,32 @@ async def route_optimize_v1(
             rd["route_type"] = "vrp"
             routes_vrp.append(rd)
 
-    # 8) Assemble final
-    routes_single = [t.model_dump() for t in single_trucks]
+    # Normalize single-stop trucks to VRP-like routes for frontend
+    routes_single: List[Dict[str, Any]] = []
+    for t in single_trucks:
+        stop = Stop(
+            customer_name=t.customer,
+            address=f"{t.city}, {t.state}",
+            city=t.city,
+            state=t.state,
+            latitude=t.latitude,
+            longitude=t.longitude,
+            weight=t.weight,
+            pieces=t.pieces,
+            order_id=t.site_id,
+            line_id="single_stop",
+        )
+        routes_single.append({
+            "truck_id": t.truck_id,
+            "route_type": "single_stop",
+            "stops": [stop.to_dict()],
+            "stop_sequence": [0],
+            "total_distance_miles": t.total_distance_miles,
+            "total_duration_minutes": t.total_duration_minutes,
+            "total_weight": t.weight,
+            "total_pieces": t.pieces,
+        })
+
     all_routes = routes_single + routes_vrp
     totals = {
         "trucks": len(all_routes),
