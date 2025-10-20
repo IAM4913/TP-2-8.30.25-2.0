@@ -57,15 +57,20 @@ def google_distance_matrix(
     rows = data.get("rows") or []
     dist_miles: List[List[float]] = []
     dur_min: List[List[float]] = []
-    for r in rows:
+    for r_idx, r in enumerate(rows):
         elements = r.get("elements") or []
         drow: List[float] = []
         trow: List[float] = []
-        for el in elements:
+        for c_idx, el in enumerate(elements):
             st = (el.get("status") or "").upper()
             if st != "OK":
-                drow.append(float("nan"))
-                trow.append(float("nan"))
+                # Fallback to haversine estimate when Google cannot provide a route
+                d = haversine_miles(
+                    origins[r_idx][0], origins[r_idx][1],
+                    destinations[c_idx][0], destinations[c_idx][1]
+                )
+                drow.append(d)
+                trow.append(driving_time_estimate_minutes(d))
             else:
                 meters = float((el.get("distance") or {}).get("value") or 0.0)
                 seconds = float((el.get("duration") or {}).get("value") or 0.0)
@@ -97,4 +102,3 @@ def haversine_matrix(
             dist[i][j] = d
             dur[i][j] = driving_time_estimate_minutes(d, avg_speed_mph)
     return dist, dur
-

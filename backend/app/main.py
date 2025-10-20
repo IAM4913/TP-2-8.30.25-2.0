@@ -7,6 +7,7 @@ import datetime as _dt
 import pandas as pd
 from io import BytesIO
 import re
+import math
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from .schemas import (
@@ -18,7 +19,7 @@ from .schemas import (
     CombineTrucksRequest,
     CombineTrucksResponse,
 )
-from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse, extract_unique_addresses
+from .excel_utils import compute_calculated_fields, _find_planning_whse_col, filter_by_planning_whse, extract_unique_addresses, apply_routing_filters
 from .optimizer_simple import naive_grouping, NO_MULTI_STOP_CUSTOMERS
 from dotenv import load_dotenv  # new
 import os
@@ -293,6 +294,18 @@ async def optimize(
             pass
 
     df = compute_calculated_fields(df)
+    df = apply_routing_filters(df)
+
+    # Debug file write to confirm optimization started
+    from pathlib import Path
+    debug_file = Path(__file__).parent.parent / "LAST_RUN.txt"
+    with open(debug_file, "w") as f:
+        f.write(f"[/optimize endpoint] Started at {_dt.datetime.now()}\n")
+        f.write(f"Order lines after filters: {len(df)}\n")
+        f.write(f"Customers: {df['Customer'].nunique()}\n")
+        f.write(f"Total weight: {df['Ready Weight'].sum():,.0f} lbs\n")
+        f.write(
+            f"Customer groups: {df.groupby(['Customer', 'shipping_city', 'shipping_state']).ngroups}\n")
 
     # Use default weight config for now - we'll add form parameter support later
     cfg = {
@@ -306,9 +319,25 @@ async def optimize(
         print(f"DataFrame shape: {df.shape}")
         print(f"Available columns: {list(df.columns)}")
         print(f"Weight config: {cfg}")
+        print(
+            f"[/optimize] Starting optimization with {len(df)} lines, {df['Customer'].nunique()} customers")
+        print(f"[/optimize] Total weight: {df['Ready Weight'].sum():,.0f} lbs")
+        print(
+            f"[/optimize] Expected trucks at 48k lbs avg: ~{df['Ready Weight'].sum() / 48000:.1f}")
         trucks_df, assigns_df = naive_grouping(df, cfg)
         print(
             f"Optimization successful: {len(trucks_df)} trucks, {len(assigns_df)} assignments")
+
+        # Update debug file with results
+        with open(debug_file, "a") as f:
+            f.write(f"\nOptimization completed:\n")
+            f.write(f"Trucks created: {len(trucks_df)}\n")
+            f.write(f"Assignments: {len(assigns_df)}\n")
+            if not trucks_df.empty:
+                f.write(
+                    f"Total truck weight: {trucks_df['totalWeight'].sum():,.0f} lbs\n")
+                f.write(
+                    f"Avg truck weight: {trucks_df['totalWeight'].mean():,.0f} lbs\n")
     except Exception as exc:  # noqa: BLE001
         print(f"Optimization error: {exc}")
         import traceback
@@ -390,14 +419,7 @@ async def geocode_validate(
         except Exception:
             pass
     df = compute_calculated_fields(df)
-
-    # Filter out rows with RPcs <= 0 before extracting addresses
-    if "RPcs" in df.columns:
-        initial_count = len(df)
-        df = df[df["RPcs"] > 0].copy()
-        filtered_count = len(df)
-        print(
-            f"[geocode-validate] Filtered {initial_count - filtered_count} rows with RPcs <= 0 (keeping {filtered_count} rows)")
+    df = apply_routing_filters(df)
 
     addrs = extract_unique_addresses(df)
 
@@ -824,14 +846,9 @@ async def route_optimize_phase2(
             pass
 
     df = compute_calculated_fields(df)
+    df = apply_routing_filters(df)
 
-    # Filter out rows with RPcs <= 0 before extracting addresses
-    if "RPcs" in df.columns:
-        initial_count = len(df)
-        df = df[df["RPcs"] > 0].copy()
-        filtered_count = len(df)
-        print(
-            f"[route-optimize] Filtered {initial_count - filtered_count} rows with RPcs <= 0 (keeping {filtered_count} rows)")
+    print(f"[route-optimize] Starting with {len(df)} filtered order lines")
 
     # Extract and geocode addresses
     addrs = extract_unique_addresses(df)
@@ -1031,38 +1048,182 @@ async def route_optimize_phase2(
         print(f"[route-optimize] All {n*n} pairs loaded from cache!")
 
     # Create Stop objects for route optimization
+    # Strategy: Pack customer orders into truck-sized loads (bin packing by customer)
     stops: List[Stop] = []
-    for idx, addr in enumerate(geocoded_addrs):
-        # Find matching orders for this address
-        addr_key = addr.get("normalized", "")
-        matching_rows = df[
-            (df["shipping_city"].str.lower() == str(addr.get("city", "")).lower()) &
-            (df["shipping_state"].str.upper() ==
-             str(addr.get("state", "")).upper())
-        ]
+    unroutable_lines: List[Dict[str, Any]] = []
 
-        if matching_rows.empty:
+    max_weight = float(maxWeightPerTruck or 52000)
+
+    # Prepare geocoded address lookup
+    addr_lookup = {}
+    for addr in geocoded_addrs:
+        city_key = str(addr.get("city", "")).lower()
+        state_key = str(addr.get("state", "")).upper()
+        addr_lookup[(city_key, state_key)] = addr
+
+    # Debug file write to confirm this code is running
+    from pathlib import Path
+    debug_file = Path(__file__).parent.parent / "LAST_RUN.txt"
+    with open(debug_file, "w") as f:
+        f.write(f"Bin packing started at {_dt.datetime.now()}\n")
+        f.write(f"Order lines: {len(df)}\n")
+        f.write(f"Customers: {df['Customer'].nunique()}\n")
+        f.write(f"Max weight: {max_weight:,.0f} lbs\n")
+
+    print(
+        f"[route-optimize] Starting truck packing with max weight: {max_weight:,.0f} lbs")
+    print(
+        f"[route-optimize] Processing {len(df)} order lines for {df['Customer'].nunique()} customers")
+
+    # Group by Customer + Destination for bin packing
+    for (customer, city, state), customer_df in df.groupby(["Customer", "shipping_city", "shipping_state"], dropna=False):
+        # Get geocoded location for this customer/destination
+        city_key = str(city).lower()
+        state_key = str(state).upper()
+        addr = addr_lookup.get((city_key, state_key))
+
+        if not addr or not addr.get("latitude") or not addr.get("longitude"):
+            print(
+                f"[route-optimize] Skipping {customer} -> {city}, {state} (no geocode)")
             continue
 
-        # Aggregate weight and pieces for this address
-        total_weight = float(matching_rows["Ready Weight"].sum())
-        total_pieces = int(matching_rows["RPcs"].sum())
+        # Sort lines by weight (descending) for better bin packing
+        customer_lines = customer_df.sort_values(
+            "Ready Weight", ascending=False).to_dict('records')
 
-        # Use first matching row for order details
-        first_row = matching_rows.iloc[0]
+        total_customer_weight = sum(line["Ready Weight"]
+                                    for line in customer_lines)
+        print(
+            f"[route-optimize] Packing {customer} -> {city}, {state}: {total_customer_weight:,.0f} lbs ({len(customer_lines)} lines)")
 
-        stops.append(Stop(
-            customer_name=str(first_row.get("Customer", "")),
-            address=addr.get("street", "") or addr.get("normalized", ""),
-            city=addr.get("city", ""),
-            state=addr.get("state", ""),
-            latitude=addr["latitude"],
-            longitude=addr["longitude"],
-            weight=total_weight,
-            pieces=total_pieces,
-            order_id=str(first_row.get("SO", "")),
-            line_id=str(first_row.get("Line", "")),
-        ))
+        # Bin packing algorithm: piece-level packing to ensure each load <= max_weight
+        truck_loads: List[Dict[str, Any]] = []
+        current_truck: Dict[str, Any] = {
+            "weight": 0.0, "pieces": 0, "lines": []}
+
+        for line in customer_lines:
+            # Extract counts and weights
+            line_pieces_total = int(line.get("RPcs") or 0)
+            if line_pieces_total <= 0:
+                continue
+
+            weight_per_piece_raw = line.get("Weight Per Piece")
+            try:
+                weight_per_piece = float(
+                    weight_per_piece_raw) if weight_per_piece_raw is not None else None
+            except Exception:
+                weight_per_piece = None
+
+            if not weight_per_piece or weight_per_piece <= 0:
+                # Fallback from total weight
+                try:
+                    lw = float(line.get("Ready Weight") or 0.0)
+                except Exception:
+                    lw = 0.0
+                weight_per_piece = (
+                    lw / line_pieces_total) if line_pieces_total > 0 else 0.0
+
+            # If a single piece exceeds max, mark unroutable and skip
+            if weight_per_piece > max_weight:
+                unroutable_lines.append({
+                    "SO": line.get("SO"),
+                    "Line": line.get("Line"),
+                    "Customer": line.get("Customer"),
+                    "shipping_city": line.get("shipping_city"),
+                    "shipping_state": line.get("shipping_state"),
+                    "weight_per_piece": float(weight_per_piece),
+                    "reason": "piece_weight_exceeds_truck_capacity",
+                })
+                continue
+
+            pieces_remaining = line_pieces_total
+            # Allocate pieces across trucks while respecting capacity
+            while pieces_remaining > 0:
+                available_capacity = max_weight - \
+                    float(current_truck["weight"])
+                # If nothing fits, finalize current truck and start a new one
+                if available_capacity < weight_per_piece - 1e-6:
+                    if current_truck["lines"]:
+                        truck_loads.append(current_truck)
+                    current_truck = {"weight": 0.0, "pieces": 0, "lines": []}
+                    available_capacity = max_weight
+
+                max_pieces_fit = int(available_capacity // weight_per_piece)
+                if max_pieces_fit <= 0:
+                    # Defensive: start a new truck if somehow we still can't fit a piece
+                    if current_truck["lines"]:
+                        truck_loads.append(current_truck)
+                    current_truck = {"weight": 0.0, "pieces": 0, "lines": []}
+                    continue
+
+                take = min(pieces_remaining, max_pieces_fit)
+                # Create a fragment line representing the allocated pieces
+                frag_weight = take * weight_per_piece
+                line_fragment = dict(line)
+                line_fragment["RPcs"] = int(take)
+                line_fragment["Ready Weight"] = float(frag_weight)
+
+                current_truck["weight"] = float(
+                    current_truck["weight"]) + float(frag_weight)
+                current_truck["pieces"] = int(
+                    current_truck["pieces"]) + int(take)
+                current_truck["lines"].append(line_fragment)
+                pieces_remaining -= take
+
+        # Don't forget the last truck
+        if current_truck["lines"]:
+            truck_loads.append(current_truck)
+
+        # Create a Stop for each truck load
+        for truck_idx, truck in enumerate(truck_loads, 1):
+            so_numbers = [str(line.get("SO", "")) for line in truck["lines"]]
+            order_id = f"{customer[:20]}-T{truck_idx}" if len(
+                truck_loads) > 1 else str(customer[:30])
+
+            stops.append(Stop(
+                customer_name=str(customer),
+                address=addr.get("street", "") or addr.get("normalized", ""),
+                city=str(city),
+                state=str(state),
+                latitude=addr["latitude"],
+                longitude=addr["longitude"],
+                weight=truck["weight"],
+                pieces=truck["pieces"],
+                order_id=order_id,
+                # Indicate how many lines in this load
+                line_id=f"{len(truck['lines'])} lines",
+            ))
+
+        if len(truck_loads) > 1:
+            print(f"  -> Split into {len(truck_loads)} truck loads")
+
+    print(
+        f"[route-optimize] Created {len(stops)} truck loads from {len(df)} order lines")
+
+    # Update debug file with detailed results
+    with open(debug_file, "w") as f:
+        f.write(f"[/route/optimize-phase2] Started at {_dt.datetime.now()}\n")
+        f.write(f"Order lines after filters: {len(df)}\n")
+        f.write(f"Max weight per truck: {max_weight:,.0f} lbs\n\n")
+        f.write(f"Bin packing completed:\n")
+        f.write(f"Truck loads created: {len(stops)}\n")
+        f.write(f"Total weight: {sum(s.weight for s in stops):,.0f} lbs\n")
+        f.write(
+            f"Avg weight per load: {sum(s.weight for s in stops) / len(stops):,.0f} lbs\n\n")
+        if unroutable_lines:
+            f.write(
+                f"Unroutable lines (piece overweight): {len(unroutable_lines)}\n")
+            for ur in unroutable_lines[:200]:
+                # Limit listing to avoid giant files
+                f.write(
+                    f"  SO {ur.get('SO')} Line {ur.get('Line')} - {ur.get('Customer')} {ur.get('shipping_city')}, {ur.get('shipping_state')} | WPP {ur.get('weight_per_piece'):,.0f}\n"
+                )
+            if len(unroutable_lines) > 200:
+                f.write(f"  ... and {len(unroutable_lines) - 200} more\n")
+        f.write(f"Stop details:\n")
+        for i, stop in enumerate(stops):
+            f.write(
+                f"  {i}: {stop.customer_name[:30]}, {stop.city} - {stop.weight:,.0f} lbs, {stop.pieces} pcs\n")
 
     if not stops:
         raise HTTPException(status_code=400, detail="No valid stops found")
@@ -1080,12 +1241,78 @@ async def route_optimize_phase2(
         max_vehicles=int(maxTrucks or 50),
     )
 
+    # Log VRP results and compute drop reasons
+    with open(debug_file, "a") as f:
+        f.write(f"\nVRP Results:\n")
+        f.write(f"Routes generated: {len(routes)}\n")
+        routed_stop_indices = set()
+        for route in routes:
+            for stop in route.stops:
+                # Find the index of this stop in the original stops list
+                for i, s in enumerate(stops):
+                    if s.order_id == stop.order_id:
+                        routed_stop_indices.add(i)
+                        break
+        dropped_indices = [i for i in range(
+            len(stops)) if i not in routed_stop_indices]
+        f.write(f"Stops routed: {len(routed_stop_indices)} / {len(stops)}\n")
+        f.write(f"Stops DROPPED by VRP: {len(dropped_indices)}\n")
+
+        # Classify drop reasons per stop
+        drop_reasons: list[dict[str, Any]] = []
+
+        def classify_reason(i: int) -> dict[str, Any]:
+            st = stops[i]
+            # Roundtrip time including service time at the stop
+            try:
+                out_min = float(dur_matrix[0][i + 1])
+                back_min = float(dur_matrix[i + 1][0])
+            except Exception:
+                out_min = 0.0
+                back_min = 0.0
+            service_min = float(serviceTimePerStopMinutes or 30)
+            rt_minutes = out_min + back_min + service_min
+            limit_minutes = float(maxDriveTimeMinutes or 720)
+            capacity_limit = float(maxWeightPerTruck or 52000)
+
+            if st.weight > capacity_limit + 1e-6:
+                reason = "stop_weight_exceeds_truck_capacity"
+            elif rt_minutes > limit_minutes + 1e-6:
+                reason = "roundtrip_time_exceeds_limit"
+            elif (out_min <= 0 and back_min <= 0):
+                reason = "no_distance_time_available"
+            else:
+                reason = "not_routed_under_constraints"
+            return {
+                "index": i,
+                "customer_name": st.customer_name,
+                "city": st.city,
+                "state": st.state,
+                "weight": float(st.weight),
+                "roundtrip_minutes": float(rt_minutes),
+                "limit_minutes": float(limit_minutes),
+                "reason": reason,
+            }
+
+        if dropped_indices:
+            for idx in dropped_indices:
+                drop_reasons.append(classify_reason(idx))
+            f.write(f"Dropped stop indices: {dropped_indices}\n")
+            f.write(f"Dropped stops with reasons:\n")
+            for dr in drop_reasons:
+                f.write(
+                    f"  {dr['index']}: {dr['customer_name'][:30]}, {dr['city']} - {dr['weight']:,.0f} lbs | reason={dr['reason']} | rt_min={dr['roundtrip_minutes']:.1f} / limit={dr['limit_minutes']:.0f}\n"
+                )
+
     return {
         "success": True,
         "routes": [r.to_dict() for r in routes],
         "depot": {"latitude": depot_lat, "longitude": depot_lng, "name": depot.get("name")},
         "total_trucks": len(routes),
         "total_stops": len(stops),
+        "unroutable": unroutable_lines,
+        # Diagnostic: reasons for dropped stops
+        "drop_reasons": drop_reasons if 'drop_reasons' in locals() else [],
     }
 
 
@@ -1131,6 +1358,7 @@ async def route_plan(
             pass
 
     df = compute_calculated_fields(df)
+    df = apply_routing_filters(df)
 
     # Optional delivery date filter: include rows whose Earliest Due <= deliveryDate
     if deliveryDate:
@@ -1322,6 +1550,7 @@ async def combine_trucks(
         except Exception:
             pass
     df = compute_calculated_fields(df)
+    df = apply_routing_filters(df)
     cfg = {
         "texas_max_lbs": req.weightConfig.texas_max_lbs,
         "texas_min_lbs": req.weightConfig.texas_min_lbs,

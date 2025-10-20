@@ -209,8 +209,8 @@ def solve_vrp(
 
     # ============ NODE DROPPING (PENALTIES) ============
     # Allow the solver to drop nodes that cannot be feasibly routed
-    # High penalty ensures nodes are only dropped if absolutely necessary
-    penalty = 100000  # Very high penalty for dropping a node
+    # Extremely high penalty to strongly discourage dropping nodes
+    penalty = 10000000  # Extremely high penalty (increased from 100k to 10M)
     for node in range(1, manager.GetNumberOfNodes()):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
@@ -253,6 +253,7 @@ def solve_vrp(
         route_time = 0
         route_weight = 0
         route_pieces = 0
+        last_node_manager_index = None
 
         while not routing.IsEnd(index):
             node_index = manager.IndexToNode(index)
@@ -268,6 +269,7 @@ def solve_vrp(
             # Get next node
             previous_index = index
             index = solution.Value(routing.NextVar(index))
+            last_node_manager_index = previous_index
 
             # Add distance and time
             if not routing.IsEnd(index):
@@ -278,6 +280,12 @@ def solve_vrp(
 
         # Only add routes with stops
         if route_stops:
+            # Add return-to-depot leg distance/time (last node -> depot)
+            if last_node_manager_index is not None:
+                last_node = manager.IndexToNode(last_node_manager_index)
+                # depot is node 0 in matrices
+                route_distance += distance_matrix[last_node][0]
+                route_time += duration_matrix[last_node][0]
             # Add service time
             route_time += len(route_stops) * service_time_per_stop_minutes
 

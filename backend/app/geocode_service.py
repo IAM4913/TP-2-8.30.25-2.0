@@ -117,7 +117,7 @@ def cache_upsert_address(
 
 
 def build_address_query(parts: Dict[str, Optional[str]]) -> str:
+    country = parts.get("country") or "USA"
     comps = [parts.get("street"), parts.get("city"),
-             parts.get("state"), parts.get("zip"), "USA"]
+             parts.get("state"), parts.get("zip"), country]
     return ", ".join([c for c in comps if c and str(c).strip()])
-
