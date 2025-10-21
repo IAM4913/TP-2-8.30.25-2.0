@@ -935,7 +935,7 @@ def _compute_depot_legs(depot_lat: float, depot_lng: float, sites: List[Dict[str
     idx_map: List[str] = []
     for s in sites:
         if s.get("latitude") and s.get("longitude"):
-            dests.append((float(s["latitude"]), float(s["longitude"])) )
+            dests.append((float(s["latitude"]), float(s["longitude"])))
             idx_map.append(s["site_id"])
     if not dests:
         return {}
@@ -943,14 +943,16 @@ def _compute_depot_legs(depot_lat: float, depot_lng: float, sites: List[Dict[str
     legs: Dict[str, Dict[str, float]] = {}
     try:
         if api_key:
-            dist, dur = google_distance_matrix(api_key, origins=[(depot_lat, depot_lng)], destinations=dests)
+            dist, dur = google_distance_matrix(
+                api_key, origins=[(depot_lat, depot_lng)], destinations=dests)
             for j, site_id in enumerate(idx_map):
                 miles = float(dist[0][j]) if dist and dist[0] else 0.0
                 minutes = float(dur[0][j]) if dur and dur[0] else 0.0
                 legs[site_id] = {"miles_out": miles, "minutes_out": minutes}
         else:
             # Haversine fallback
-            hv_dist, hv_dur = haversine_matrix([(depot_lat, depot_lng)] + dests)
+            hv_dist, hv_dur = haversine_matrix(
+                [(depot_lat, depot_lng)] + dests)
             for j, site_id in enumerate(idx_map):
                 miles = hv_dist[0][j+1]
                 minutes = hv_dur[0][j+1]
