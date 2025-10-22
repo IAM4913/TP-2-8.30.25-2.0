@@ -79,14 +79,10 @@ def _norm_key(s: Any) -> str:
 def _find_planning_whse_col(df: pd.DataFrame) -> Optional[str]:
     """Find the Planning Warehouse column regardless of case/spacing/variants."""
     normalized = {_norm_key(c): c for c in df.columns}
-    # Preferred direct matches
-    for target in ("planningwhse", "planningwarehouse", "planningwhs", "planningwhsecode"):
+    # Direct check for common column names
+    for target in ("whse", "warehouse", "whs", "planningwhse", "planningwarehouse"):
         if target in normalized:
             return normalized[target]
-    # Fallback: contains both planning and whse/warehouse tokens
-    for nk, orig in normalized.items():
-        if "planning" in nk and ("whse" in nk or "warehouse" in nk or "whs" in nk):
-            return orig
     return None
 
 
