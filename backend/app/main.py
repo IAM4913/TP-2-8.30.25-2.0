@@ -1272,42 +1272,69 @@ async def route_optimize_v1(
             (float(s.get("latitude") or 0.0), float(s.get("longitude") or 0.0)) for s in residual_sites
         ]
 
-        # Build matrices using Google with caching logic similar to phase2
+        # Build matrices - reuse depot legs to avoid duplicate API calls
         n = len(coords)
         dist_matrix = [[0.0] * n for _ in range(n)]
         dur_matrix = [[0.0] * n for _ in range(n)]
 
+        # Populate depot row/col from already-computed legs (avoid duplicate calls)
+        for i, site in enumerate(residual_sites, start=1):
+            site_id = site.get("site_id")
+            leg = legs.get(site_id, {})
+            depot_miles = leg.get("miles_out", 0.0)
+            depot_mins = leg.get("minutes_out", 0.0)
+            # Symmetric: depot→site = site→depot
+            dist_matrix[0][i] = depot_miles
+            dist_matrix[i][0] = depot_miles
+            dur_matrix[0][i] = depot_mins
+            dur_matrix[i][0] = depot_mins
+
+        # Now calculate Site↔Site distances with batching
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-        if not api_key:
-            hv_dist, hv_dur = haversine_matrix(coords)
-            for i in range(n):
-                for j in range(n):
-                    dist_matrix[i][j] = hv_dist[i][j]
-                    dur_matrix[i][j] = hv_dur[i][j]
+        site_coords = coords[1:]  # Exclude depot
+
+        if not api_key or n > 50:
+            # Use Haversine for large datasets or no API key
+            hv_dist, hv_dur = haversine_matrix(site_coords)
+            for i in range(len(site_coords)):
+                for j in range(len(site_coords)):
+                    dist_matrix[i+1][j+1] = hv_dist[i][j]
+                    dur_matrix[i+1][j+1] = hv_dur[i][j]
         else:
-            try:
-                full_dist, full_dur = google_distance_matrix(
-                    api_key, coords, coords)
-                for i in range(n):
-                    for j in range(n):
-                        dist_matrix[i][j] = full_dist[i][j]
-                        dur_matrix[i][j] = full_dur[i][j]
-            except Exception:
-                try:
-                    for i in range(n):
-                        for j in range(n):
-                            if i == j:
-                                continue
-                            pair_dist, pair_dur = google_distance_matrix(
-                                api_key, [coords[i]], [coords[j]])
-                            dist_matrix[i][j] = pair_dist[0][0]
-                            dur_matrix[i][j] = pair_dur[0][0]
-                except Exception:
-                    hv_dist, hv_dur = haversine_matrix(coords)
-                    for i in range(n):
-                        for j in range(n):
-                            dist_matrix[i][j] = hv_dist[i][j]
-                            dur_matrix[i][j] = hv_dur[i][j]
+            # Batch Site↔Site in 25×25 chunks to respect Google API limits
+            BATCH_SIZE = 25
+            num_sites = len(site_coords)
+
+            for i_start in range(0, num_sites, BATCH_SIZE):
+                i_end = min(i_start + BATCH_SIZE, num_sites)
+                for j_start in range(0, num_sites, BATCH_SIZE):
+                    j_end = min(j_start + BATCH_SIZE, num_sites)
+
+                    batch_origins = site_coords[i_start:i_end]
+                    batch_dests = site_coords[j_start:j_end]
+
+                    try:
+                        batch_dist, batch_dur = google_distance_matrix(
+                            api_key, batch_origins, batch_dests)
+
+                        for i_local in range(len(batch_origins)):
+                            for j_local in range(len(batch_dests)):
+                                i_global = i_start + i_local + 1  # +1 for depot offset
+                                j_global = j_start + j_local + 1
+                                dist_matrix[i_global][j_global] = batch_dist[i_local][j_local]
+                                dur_matrix[i_global][j_global] = batch_dur[i_local][j_local]
+                    except Exception as e:
+                        # Fallback to haversine for this batch
+                        print(
+                            f"[vrp-matrix] Batch failed ({i_start}:{i_end}, {j_start}:{j_end}), using haversine: {e}")
+                        hv_dist, hv_dur = haversine_matrix(
+                            batch_origins + batch_dests)
+                        for i_local in range(len(batch_origins)):
+                            for j_local in range(len(batch_dests)):
+                                i_global = i_start + i_local + 1
+                                j_global = j_start + j_local + 1
+                                dist_matrix[i_global][j_global] = hv_dist[i_local][j_local]
+                                dur_matrix[i_global][j_global] = hv_dur[i_local][j_local]
 
         # Build stops
         stops: List[Stop] = []
