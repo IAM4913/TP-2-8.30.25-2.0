@@ -1,0 +1,58 @@
+[/route/optimize-phase2] Started at 2025-10-20 14:40:05.891954
+Order lines after filters: 151
+Max weight per truck: 52,000 lbs
+
+Bin packing completed:
+Truck loads created: 30
+Total weight: 777,279 lbs
+Avg weight per load: 25,909 lbs
+
+Stop details:
+  0: 4 Front Engineered Solution   , Pharr - 10,152 lbs, 26 pcs
+  1: 4Front Engineered Solutions   , Carrollton - 5,649 lbs, 24 pcs
+  2: Auxiliary Trading & Metal Work, Kennedale - 1,750 lbs, 14 pcs
+  3: Big Tex Trailer Mfg Plant #400, Madill - 3,560 lbs, 16 pcs
+  4: GH Cranes & Components USA    , Terrell - 24,063 lbs, 72 pcs
+  5: Greenbrier Rail Services - Cle, Cleburne - 357 lbs, 12 pcs
+  6: Halo Fabrication and Metalwork, Terrell - 6,137 lbs, 14 pcs
+  7: Kannon Manufacturing Inc      , Fort Worth - 1,426 lbs, 24 pcs
+  8: Load Trail MX                 , Cuahtemoc - 51,956 lbs, 353 pcs
+  9: Load Trail MX                 , Cuahtemoc - 37,669 lbs, 287 pcs
+  10: Long Industries Inc           , Lavon - 16,330 lbs, 9 pcs
+  11: M M W Fabrication Ltd         , Hurst - 4,589 lbs, 155 pcs
+  12: Norton Metals Inc             , Saginaw - 50,886 lbs, 38 pcs
+  13: Omi Cranes                    , Royse City - 32,178 lbs, 237 pcs
+  14: Organic Recycler              , Forest Hill - 1,666 lbs, 1 pcs
+  15: PJ Trailers Mexico            , Chihuahua - 26,175 lbs, 75 pcs
+  16: Phillips Welding Supply Inc   , Weatherford - 13,188 lbs, 85 pcs
+  17: SAE TOWERS MEXICO S DE RL DE C, GENERAL ESCOBEDO - 11,230 lbs, 4 pcs
+  18: Sabre                         , Fort Worth - 51,935 lbs, 41 pcs
+  19: Sabre                         , Fort Worth - 23,292 lbs, 171 pcs
+  20: Sabre Tubular Structures      , Alvarado - 47,844 lbs, 11 pcs
+  21: Sabre Tubular Structures      , Alvarado - 49,504 lbs, 15 pcs
+  22: Sabre Tubular Structures      , Alvarado - 50,643 lbs, 10 pcs
+  23: Sabre Tubular Structures      , Alvarado - 42,465 lbs, 13 pcs
+  24: Underground Products of Texas , Fort Worth - 45,741 lbs, 7 pcs
+  25: Underground Products of Texas , Fort Worth - 45,741 lbs, 7 pcs
+  26: Underground Products of Texas , Fort Worth - 45,741 lbs, 7 pcs
+  27: Waste Management Dallas       , Dallas - 11,382 lbs, 39 pcs
+  28: Willbanks Metals Inc          , Fort Worth - 51,957 lbs, 92 pcs
+  29: Willbanks Metals Inc          , Fort Worth - 12,072 lbs, 96 pcs
+
+VRP Results:
+Routes generated: 9
+Stops routed: 19 / 30
+Stops DROPPED by VRP: 11
+Dropped stop indices: [12, 13, 14, 19, 23, 24, 25, 26, 27, 28, 29]
+Dropped stops with reasons:
+  12: Norton Metals Inc             , Saginaw - 50,886 lbs | reason=roundtrip_time_exceeds_limit | rt_min=2171.1 / limit=720
+  13: Omi Cranes                    , Royse City - 32,178 lbs | reason=roundtrip_time_exceeds_limit | rt_min=1580.2 / limit=720
+  14: Organic Recycler              , Forest Hill - 1,666 lbs | reason=roundtrip_time_exceeds_limit | rt_min=2156.1 / limit=720
+  19: Sabre                         , Fort Worth - 23,292 lbs | reason=roundtrip_time_exceeds_limit | rt_min=1603.6 / limit=720
+  23: Sabre Tubular Structures      , Alvarado - 42,465 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720
+  24: Underground Products of Texas , Fort Worth - 45,741 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720
+  25: Underground Products of Texas , Fort Worth - 45,741 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720
+  26: Underground Products of Texas , Fort Worth - 45,741 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720
+  27: Waste Management Dallas       , Dallas - 11,382 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720
+  28: Willbanks Metals Inc          , Fort Worth - 51,957 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720
+  29: Willbanks Metals Inc          , Fort Worth - 12,072 lbs | reason=no_distance_time_available | rt_min=30.0 / limit=720

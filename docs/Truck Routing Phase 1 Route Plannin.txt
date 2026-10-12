@@ -1,0 +1,401 @@
+Truck Routing Phase 1: Route Planning Foundation - Product Requirements Document
+Overview
+Phase 1 establishes the data infrastructure needed for geographic routing by adding address validation, geocoding, and distance calculation capabilities to the existing truck planner system.
+Objectives
+
+Validate and standardize customer addresses from Excel uploads
+Geocode addresses to obtain latitude/longitude coordinates
+Calculate distance matrices between locations
+Store geographic data for future routing operations
+Provide visibility into data quality and geocoding confidence
+
+Functional Requirements
+1. Address Data Management
+1.1 Address Extraction & Standardization
+
+Input Processing
+
+Detect address fields in uploaded Excel (various column name formats)
+Handle partial addresses (missing street, suite, etc.)
+Standardize address formatting for geocoding
+Support both single-line and component-based addresses
+
+
+Address Components
+
+Street number and name
+Suite/Unit/Building information
+City, State, ZIP code
+Country (default: USA)
+
+
+
+1.2 Address Validation
+
+Validation Levels
+
+Complete match: Full address verified
+Partial match: City/state confirmed, street uncertain
+Invalid: Cannot locate address
+
+
+Confidence Scoring
+
+0-1 scale based on match quality
+Factors: completeness, geocoding precision, source reliability
+
+
+User Feedback
+
+Show validation status for each address
+Provide suggested corrections for partial/invalid addresses
+Flag addresses needing manual review
+
+
+
+2. Geocoding Services
+2.1 Service Integration
+
+Multiple Provider Support
+
+Primary: Google Maps Geocoding API
+Fallback: Mapbox or HERE APIs
+Manual override capability
+
+
+Batch Processing
+
+Process entire Excel file in one operation
+Progress indication for large files
+Partial failure handling
+
+
+
+2.2 Caching Strategy
+
+Cache Validated Addresses
+
+Store geocoded results in database
+Reduce API calls and costs
+Update cache on address changes
+
+
+Cache Key Structure
+
+Normalized address as key
+Include city, state for uniqueness
+TTL for cache entries (configurable)
+
+
+
+3. Distance Calculations
+3.1 Distance Matrix
+
+Calculation Methods
+
+Driving distance (via routing API)
+Straight-line distance (Haversine formula)
+Time estimates (optional)
+
+
+Matrix Operations
+
+Origin-to-destination distances
+Round-trip calculations
+Multi-stop path distances
+
+
+
+3.2 Depot Management
+
+Depot Configuration
+
+Set primary depot location
+Support multiple depot locations
+Default: Fort Worth, TX
+
+
+Depot-based Calculations
+
+Distance from depot to all customers
+Return-to-depot distances
+Territory radius from depot
+
+
+
+4. Data Storage
+4.1 Geographic Data Model
+
+Customer Locations
+
+Customer ID/name
+Validated address
+Coordinates (lat/lng)
+Confidence score
+Last updated timestamp
+
+
+Address Cache
+
+Original input address
+Standardized address
+Geocoding results
+Validation status
+
+
+
+4.2 Integration with Existing Data
+
+Order Enhancement
+
+Add coordinates to order records
+Link orders to cached addresses
+Maintain address history
+
+
+Backward Compatibility
+
+System works without geocoding
+Graceful degradation if geocoding fails
+Manual coordinate entry option
+
+
+
+5. User Interface Updates
+5.1 Upload & Validation Screen
+
+Address Validation Panel
+
+Show validation results after upload
+Color coding: Green (valid), Yellow (partial), Red (invalid)
+Bulk actions for fixing addresses
+
+
+Geocoding Status
+
+Progress bar during geocoding
+Success/failure counts
+Option to proceed without full geocoding
+
+
+
+5.2 Address Management View
+
+Address Review Table
+
+List all unique addresses
+Show validation status and confidence
+Edit capabilities for corrections
+
+
+Map Preview
+
+Visual plot of geocoded addresses
+Identify geographic clusters
+Highlight problem addresses
+
+
+
+6. API Endpoints
+6.1 Validation & Geocoding
+
+POST /api/geocode/validate - Validate addresses in uploaded file
+POST /api/geocode/batch - Batch geocode all addresses
+GET /api/geocode/status/{job_id} - Check batch job status
+POST /api/geocode/manual - Manually set coordinates
+
+6.2 Distance Operations
+
+POST /api/distance-matrix - Calculate distance matrix
+GET /api/distance/{origin}/{destination} - Single distance calculation
+POST /api/distance/batch - Bulk distance calculations
+
+6.3 Data Management
+
+GET /api/addresses/cached - List cached addresses
+PUT /api/addresses/{id} - Update address record
+DELETE /api/addresses/cache - Clear cache
+GET /api/depot/location - Get depot configuration
+PUT /api/depot/location - Update depot location
+
+Non-Functional Requirements
+Performance
+
+Geocode 100 addresses in < 30 seconds
+Cache hit rate > 80% after initial population
+Distance matrix calculation < 5 seconds for 50x50 matrix
+
+Reliability
+
+Graceful handling of geocoding API failures
+Fallback to cached or manual data
+Queue system for retry logic
+
+Security
+
+Secure storage of API keys
+Rate limiting to prevent API abuse
+Audit logging for address changes
+
+Scalability
+
+Support for 10,000+ unique addresses
+Efficient batch processing
+Database indexing for quick lookups
+
+Implementation Checklist
+Backend Development
+Data Models & Database
+
+ Design address validation schema
+ Create geocoded address model
+ Design distance cache schema
+ Create database migrations
+ Set up indexes for performance
+ Implement cache TTL logic
+
+Service Layer
+
+ Create geocoding service interface
+ Implement Google Maps geocoding service
+ Add Mapbox geocoding service (optional)
+ Build distance calculation service
+ Implement caching layer
+ Add retry logic for failed API calls
+ Create service factory pattern
+
+API Development
+
+ Build address validation endpoint
+ Create batch geocoding endpoint
+ Implement distance matrix endpoint
+ Add depot management endpoints
+ Create address cache management endpoints
+ Add progress tracking for batch operations
+ Implement error handling and logging
+
+Excel Processing Updates
+
+ Update Excel parser for address fields
+ Add address extraction logic
+ Implement address standardization
+ Add geocoding results to export
+ Handle missing address components
+
+Integration
+
+ Integrate with existing optimization flow
+ Update order processing to include coordinates
+ Modify truck assignment to store location data
+ Ensure backward compatibility
+
+Frontend Development
+Components
+
+ Build address validation results component
+ Create geocoding progress indicator
+ Design address review/edit table
+ Add map visualization component
+ Build depot configuration form
+ Create confidence score indicators
+
+State Management
+
+ Add geocoding status to app state
+ Implement address validation state
+ Create distance matrix state
+ Add depot location state
+
+API Integration
+
+ Connect to validation endpoints
+ Implement geocoding API calls
+ Add distance calculation requests
+ Handle batch operation progress
+ Implement error handling
+
+User Experience
+
+ Add loading states during geocoding
+ Show validation warnings/errors
+ Implement address correction flow
+ Add help text and tooltips
+ Create success/failure notifications
+
+Configuration & Deployment
+Environment Setup
+
+ Add geocoding API keys to .env
+ Configure depot default location
+ Set up cache TTL values
+ Configure rate limiting
+ Add feature flags for providers
+
+Testing
+
+ Unit tests for address standardization
+ Unit tests for geocoding services
+ Unit tests for distance calculations
+ Integration tests for API endpoints
+ End-to-end tests for upload flow
+ Performance tests for batch operations
+
+Documentation
+
+ API endpoint documentation
+ Service integration guide
+ Configuration documentation
+ User guide for address management
+ Troubleshooting guide
+
+Monitoring & Logging
+
+ Add geocoding success/failure metrics
+ Monitor API rate limits
+ Track cache hit rates
+ Log validation issues
+ Set up alerts for API failures
+
+Success Criteria
+Acceptance Criteria
+
+Successfully geocode 90%+ of valid addresses
+All geocoded addresses have confidence scores
+Distance matrix calculations complete without errors
+Cache reduces API calls by 80% on subsequent runs
+System continues to work if geocoding fails
+
+Key Metrics
+
+Geocoding success rate: > 90%
+Average confidence score: > 0.8
+Cache hit rate: > 80%
+API response time: < 2 seconds
+Batch processing: < 1 minute for 500 addresses
+
+Risks & Mitigations
+Technical Risks
+
+API Rate Limiting: Implement queuing and caching
+Invalid Addresses: Provide manual override option
+API Costs: Monitor usage, implement caching aggressively
+Service Downtime: Multiple provider fallback
+
+Data Risks
+
+Address Quality: Validation and correction workflow
+Coordinate Accuracy: Confidence scoring and manual review
+Cache Staleness: TTL and refresh mechanisms
+
+Dependencies
+External Services
+
+Google Maps API account and key
+Optional: Mapbox or HERE API accounts
+Database (existing Supabase or new PostgreSQL)
+
+Internal Dependencies
+
+Existing Excel upload functionality
+Current optimization engine
+Order data model
